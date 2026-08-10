@@ -41,6 +41,7 @@ struct ElementTokenField: NSViewRepresentable {
         }
     }
 
+    @MainActor
     final class Coordinator: NSObject, NSTokenFieldDelegate {
         var parent: ElementTokenField
 

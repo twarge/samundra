@@ -10,8 +10,10 @@ let samundraLog = Logger(subsystem: "com.twarge.samundra", category: "usb")
 
 // MARK: - Cross-thread settings
 
-/// Settings shared between the main actor and the USB queue.
-final class AcquisitionSettings {
+/// Settings shared between the main actor and the USB queue. Every access
+/// goes through the lock; reads and writes are instant on both sides, which
+/// is why this is a lock box rather than actor state the UI would await.
+final class AcquisitionSettings: @unchecked Sendable {
     private let lock = NSLock()
     private var _integrationMicros: UInt32 = 10_000
     private var _scansToAverage = 1
@@ -36,16 +38,24 @@ final class AcquisitionSettings {
     }
 }
 
-// MARK: - Acquisition engine (runs on the USB queue)
+// MARK: - Acquisition engine
 
-private final class AcquisitionEngine {
+/// Runs the blocking acquisition loop. The actor's executor is the USB
+/// dispatch queue itself, so every isolated method — including the blocking
+/// IOUSBHost calls — runs on that queue's thread, never on the cooperative
+/// pool, and the compiler now enforces the confinement the queue used to
+/// provide by convention.
+private actor AcquisitionEngine {
     private let device: HR4000Device
-    private let queue: DispatchQueue
+    private let queue: DispatchSerialQueue
     private let settings: AcquisitionSettings
+    private let onSpectrum: @MainActor @Sendable (Spectrum, Double?) -> Void
+    private let onStopped: @MainActor @Sendable () -> Void
+    private let onError: @MainActor @Sendable (Error) -> Void
 
-    var onSpectrum: ((Spectrum, Double?) -> Void)?  // called on main
-    var onStopped: (() -> Void)?                    // called on main
-    var onError: ((Error) -> Void)?                 // called on main
+    nonisolated var unownedExecutor: UnownedSerialExecutor {
+        queue.asUnownedSerialExecutor()
+    }
 
     private var accumulator: [Double] = []
     private var accumulated = 0
@@ -57,22 +67,29 @@ private final class AcquisitionEngine {
     private var smoothedRate: Double?
     private var lastPublish = Date.distantPast
 
-    init(device: HR4000Device, queue: DispatchQueue, settings: AcquisitionSettings) {
+    init(
+        device: HR4000Device,
+        queue: DispatchSerialQueue,
+        settings: AcquisitionSettings,
+        onSpectrum: @escaping @MainActor @Sendable (Spectrum, Double?) -> Void,
+        onStopped: @escaping @MainActor @Sendable () -> Void,
+        onError: @escaping @MainActor @Sendable (Error) -> Void
+    ) {
         self.device = device
         self.queue = queue
         self.settings = settings
+        self.onSpectrum = onSpectrum
+        self.onStopped = onStopped
+        self.onError = onError
     }
 
     func start() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            try? self.device.resynchronize()
-            self.resetGroup()
-            self.discardNextFrame = false
-            self.lastGroupEnd = nil
-            self.smoothedRate = nil
-            self.tick()
-        }
+        try? device.resynchronize()
+        resetGroup()
+        discardNextFrame = false
+        lastGroupEnd = nil
+        smoothedRate = nil
+        tick()
     }
 
     private func resetGroup() {
@@ -83,7 +100,8 @@ private final class AcquisitionEngine {
 
     private func tick() {
         guard settings.running else {
-            DispatchQueue.main.async { self.onStopped?() }
+            let onStopped = onStopped
+            Task { @MainActor in onStopped() }
             return
         }
         do {
@@ -115,16 +133,20 @@ private final class AcquisitionEngine {
                 }
             }
 
-            queue.async { [weak self] in self?.tick() }
+            // Re-enqueue rather than loop: pending messages (settings pushes,
+            // stop) interleave between frames, exactly as queue.async did.
+            Task { self.tick() }
         } catch {
             let wasRunning = settings.running
             settings.running = false
-            DispatchQueue.main.async {
+            let onStopped = onStopped
+            let onError = onError
+            Task { @MainActor in
                 if wasRunning {
-                    self.onError?(error)
+                    onError(error)
                 } else {
                     // Stopped mid-read via pipe abort; not a real failure.
-                    self.onStopped?()
+                    onStopped()
                 }
             }
         }
@@ -176,7 +198,8 @@ private final class AcquisitionEngine {
         if now.timeIntervalSince(lastPublish) >= 0.04 {
             lastPublish = now
             let rate = smoothedRate
-            DispatchQueue.main.async { self.onSpectrum?(spectrum, rate) }
+            let onSpectrum = onSpectrum
+            Task { @MainActor in onSpectrum(spectrum, rate) }
         }
     }
 }
@@ -242,7 +265,7 @@ final class SpectrometerService: ObservableObject {
         }
     }
 
-    private let usbQueue = DispatchQueue(label: "com.twarge.samundra.usb", qos: .userInitiated)
+    private let usbQueue = DispatchSerialQueue(label: "com.twarge.samundra.usb", qos: .userInitiated)
     private let settings = AcquisitionSettings()
     private var device: HR4000Device?
     private var engine: AcquisitionEngine?
@@ -314,7 +337,7 @@ final class SpectrometerService: ObservableObject {
         case .success(let opened):
             samundraLog.info("Connected to \(opened.info.model, privacy: .public) \(opened.info.serialNumber, privacy: .public)")
             opened.onTermination = { [weak self] in
-                DispatchQueue.main.async { self?.handleUnplug() }
+                Task { @MainActor in self?.handleUnplug() }
             }
             device = opened
             deviceInfo = opened.info
@@ -356,30 +379,33 @@ final class SpectrometerService: ObservableObject {
     }
 
     private func startEngine(with device: HR4000Device) {
-        let engine = AcquisitionEngine(device: device, queue: usbQueue, settings: settings)
-        engine.onSpectrum = { [weak self] spectrum, rate in
-            guard let self else { return }
-            self.latestSpectrum = spectrum
-            if let rate { self.acquisitionRate = rate }
-        }
-        engine.onStopped = { [weak self] in
-            self?.isAcquiring = false
-            self?.acquisitionRate = nil
-        }
-        engine.onError = { [weak self] error in
-            guard let self else { return }
-            self.isAcquiring = false
-            self.acquisitionRate = nil
-            self.lastError = error.localizedDescription
-            if self.isDisconnectError(error) {
-                self.handleUnplug()
-            }
-        }
+        let engine = AcquisitionEngine(
+            device: device,
+            queue: usbQueue,
+            settings: settings,
+            onSpectrum: { [weak self] spectrum, rate in
+                guard let self else { return }
+                self.latestSpectrum = spectrum
+                if let rate { self.acquisitionRate = rate }
+            },
+            onStopped: { [weak self] in
+                self?.isAcquiring = false
+                self?.acquisitionRate = nil
+            },
+            onError: { [weak self] error in
+                guard let self else { return }
+                self.isAcquiring = false
+                self.acquisitionRate = nil
+                self.lastError = error.localizedDescription
+                if self.isDisconnectError(error) {
+                    self.handleUnplug()
+                }
+            })
         self.engine = engine
         lastError = nil
         isAcquiring = true
         settings.running = true
-        engine.start()
+        Task { await engine.start() }
     }
 
     func stopRecording() {

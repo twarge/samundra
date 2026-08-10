@@ -28,6 +28,7 @@ struct AtomicLine: Hashable, Identifiable {
     }
 }
 
+@MainActor
 final class AtomicLineDatabase {
     static let shared = AtomicLineDatabase()
 

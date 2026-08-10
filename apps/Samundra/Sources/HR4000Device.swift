@@ -73,14 +73,21 @@ final class HR4000Device: @unchecked Sendable {
     private var closed = false
 
     /// Fired (on an internal queue) when the device is unplugged.
-    var onTermination: (() -> Void)? {
+    var onTermination: (@Sendable () -> Void)? {
         get { terminationRelay.handler }
         set { terminationRelay.handler = newValue }
     }
     private let terminationRelay: TerminationRelay
 
-    private final class TerminationRelay {
-        var handler: (() -> Void)?
+    /// The IOUSBHost interest callback fires on a private queue; the handler
+    /// reference is lock-guarded.
+    private final class TerminationRelay: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _handler: (@Sendable () -> Void)?
+        var handler: (@Sendable () -> Void)? {
+            get { lock.withLock { _handler } }
+            set { lock.withLock { _handler = newValue } }
+        }
     }
 
     // MARK: - Lifecycle
