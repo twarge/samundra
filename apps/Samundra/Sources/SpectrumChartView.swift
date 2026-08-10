@@ -350,8 +350,8 @@ struct SpectrumChartView: View {
     /// so the axis holds still instead of bouncing with every frame.
     private func updateYTop() {
         let dataMax = max(spectrum.counts.max() ?? 0, 10) / countScale
-        if yTop <= 0 || dataMax > yTop / 1.02 || dataMax < yTop * 0.55 {
-            yTop = dataMax * 1.12
+        if yTop <= 0 || dataMax > yTop / 1.02 || dataMax < yTop * 0.35 {
+            yTop = dataMax * 1.25
         }
     }
 
