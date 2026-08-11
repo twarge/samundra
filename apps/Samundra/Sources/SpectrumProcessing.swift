@@ -16,12 +16,13 @@ enum SpectrumProcessing {
     static func process(
         raw: [Double],
         options: ProcessingOptions,
-        nonlinearityCoefficients: [Double]?
+        nonlinearityCoefficients: [Double]?,
+        darkPixels: Range<Int> = HR4000.darkPixelRange
     ) -> [Double] {
         var values = raw
 
         if options.electricDark {
-            let darkPixels = HR4000.darkPixelRange.clamped(to: values.indices)
+            let darkPixels = darkPixels.clamped(to: values.indices)
             if !darkPixels.isEmpty {
                 let dark = values[darkPixels].reduce(0, +) / Double(darkPixels.count)
                 for i in values.indices { values[i] -= dark }

@@ -19,9 +19,9 @@ enum HR4000Error: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .deviceNotFound:
-            return "No Ocean Optics HR4000 found on USB."
+            return "No supported spectrometer found on USB."
         case .interfaceNotFound:
-            return "The HR4000 USB interface did not appear after configuration."
+            return "The spectrometer\u{2019}s USB interface did not appear after configuration."
         case .pipeUnavailable(let address):
             return String(format: "USB endpoint 0x%02X is unavailable.", address)
         case .transferFailed(let what, let underlying):
@@ -53,6 +53,9 @@ final class HR4000Device: @unchecked Sendable {
         let nonlinearityCoefficients: [Double]?
         let wavelengths: [Double]
         let usbHighSpeed: Bool
+        let darkPixels: Range<Int>
+        let firstSignalPixel: Int
+        let fullScaleCounts: Double
     }
 
     private let device: IOUSBHostDevice
@@ -69,6 +72,8 @@ final class HR4000Device: @unchecked Sendable {
     private var commandBuffers: [Int: NSMutableData] = [:]
 
     private(set) var info: Info!
+    private let model: SpectrometerModel
+    private let usbProductName: String?
     private(set) var integrationMicros: UInt32 = 10_000
     private var closed = false
 
@@ -126,13 +131,13 @@ final class HR4000Device: @unchecked Sendable {
     private static func findService() -> io_service_t {
         let matching = IOUSBHostDevice.__createMatchingDictionary(
             withVendorID: NSNumber(value: HR4000.vendorID),
-            productID: NSNumber(value: HR4000.productID),
+            productID: nil,
             bcdDevice: nil,
             deviceClass: nil,
             deviceSubclass: nil,
             deviceProtocol: nil,
             speed: nil,
-            productIDArray: nil)
+            productIDArray: SpectrometerModel.supported.map { NSNumber(value: $0.productID) })
         return IOServiceGetMatchingService(kIOMainPortDefault, matching.takeRetainedValue())
     }
 
@@ -151,6 +156,9 @@ final class HR4000Device: @unchecked Sendable {
     private init(service: io_service_t, forceConfigure: Bool = false) throws {
         let relay = TerminationRelay()
         terminationRelay = relay
+        usbProductName = IORegistryEntryCreateCFProperty(
+            service, "USB Product Name" as CFString, kCFAllocatorDefault, 0)?
+            .takeRetainedValue() as? String
         // kIOMessageServiceIsTerminated
         let terminatedMessage: UInt32 = 0xE000_0010
 
@@ -163,6 +171,14 @@ final class HR4000Device: @unchecked Sendable {
                     relay.handler?()
                 }
             })
+
+        guard let descriptor = device.deviceDescriptor,
+              let matched = SpectrometerModel.forProductID(Int(descriptor.pointee.idProduct))
+        else {
+            device.destroy()
+            throw HR4000Error.deviceNotFound
+        }
+        model = matched
 
         do {
             if forceConfigure || device.configurationDescriptor == nil {
@@ -181,7 +197,9 @@ final class HR4000Device: @unchecked Sendable {
             commandOut = try Self.pipe(HR4000.Endpoint.commandOut, on: interface)
             replyIn = try Self.pipe(HR4000.Endpoint.replyIn, on: interface)
             spectrumIn = try Self.pipe(HR4000.Endpoint.spectrumIn, on: interface)
-            spectrumFirstIn = try? interface.copyPipe(withAddress: HR4000.Endpoint.spectrumFirstIn)
+            spectrumFirstIn = model.usesSecondSpectrumEndpoint
+                ? try? interface.copyPipe(withAddress: HR4000.Endpoint.spectrumFirstIn)
+                : nil
 
             replyBuffer = try interface.ioData(withCapacity: 64)
             requestSpectrumBuffer = try interface.ioData(withCapacity: 1)
@@ -189,8 +207,8 @@ final class HR4000Device: @unchecked Sendable {
                 ? nil
                 : try interface.ioData(withCapacity: HR4000.highSpeedFirstChunk)
             let restLength = spectrumFirstIn == nil
-                ? HR4000.rawSpectrumLength
-                : HR4000.rawSpectrumLength - HR4000.highSpeedFirstChunk
+                ? model.rawSpectrumLength
+                : model.rawSpectrumLength - HR4000.highSpeedFirstChunk
             spectrumBufferRest = try interface.ioData(withCapacity: restLength)
         } catch {
             interface.destroy()
@@ -292,12 +310,15 @@ final class HR4000Device: @unchecked Sendable {
         }
 
         info = Info(
-            model: HR4000.modelName,
+            model: usbProductName ?? model.name,
             serialNumber: serial,
             wavelengthCoefficients: wlCoefficients,
             nonlinearityCoefficients: nlCoefficients,
-            wavelengths: HR4000.wavelengths(coefficients: wlCoefficients),
-            usbHighSpeed: highSpeed)
+            wavelengths: HR4000.wavelengths(coefficients: wlCoefficients, count: model.activePixels),
+            usbHighSpeed: highSpeed,
+            darkPixels: model.darkPixels,
+            firstSignalPixel: model.firstSignalPixel,
+            fullScaleCounts: model.fullScaleCounts)
     }
 
     // MARK: - Commands
@@ -353,7 +374,7 @@ final class HR4000Device: @unchecked Sendable {
         try send([HR4000.Command.requestSpectrum], buffer: requestSpectrumBuffer)
 
         let timeout = Double(integrationMicros) / 1e6 + 2.0
-        var raw = Data(capacity: HR4000.rawSpectrumLength)
+        var raw = Data(capacity: model.rawSpectrumLength)
         do {
             if let firstPipe = spectrumFirstIn, let firstBuffer = spectrumBufferFirst {
                 raw.append(try read(firstPipe, into: firstBuffer, timeout: timeout,
@@ -366,19 +387,20 @@ final class HR4000Device: @unchecked Sendable {
             throw error
         }
 
-        guard raw.count == HR4000.rawSpectrumLength else {
+        guard raw.count == model.rawSpectrumLength else {
             try? resynchronize()
-            throw HR4000Error.shortTransfer(expected: HR4000.rawSpectrumLength, got: raw.count)
+            throw HR4000Error.shortTransfer(expected: model.rawSpectrumLength, got: raw.count)
         }
         guard raw[raw.count - 1] == HR4000.syncByte else {
             try? resynchronize()
             throw HR4000Error.badSyncByte(raw[raw.count - 1])
         }
 
+        let mask = model.pixelXORMask
         return raw.withUnsafeBytes { buffer -> [UInt16] in
             let words = buffer.bindMemory(to: UInt16.self)
-            return (0..<HR4000.pixelCount).map { i in
-                UInt16(littleEndian: words[i]) ^ HR4000.pixelXORMask
+            return (0..<model.activePixels).map { i in
+                UInt16(littleEndian: words[i]) ^ mask
             }
         }
     }

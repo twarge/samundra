@@ -28,6 +28,8 @@ struct Spectrum: Equatable {
     /// Index of the first real signal pixel in `counts` — nonzero only when
     /// the detector's dummy and optically masked pixels are kept in the data.
     var firstSignalIndex = 0
+    /// The connected model's ADC full scale, for display normalization.
+    var fullScaleCounts = 16383.0
 }
 
 extension Spectrum {

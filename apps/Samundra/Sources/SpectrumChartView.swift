@@ -335,11 +335,11 @@ struct SpectrumChartView: View {
     }
 
     /// Displayed counts are divided by this; 1 shows raw ADC counts.
-    private var countScale: Double { normalizeCounts ? HR4000.maxCounts : 1 }
+    private var countScale: Double { normalizeCounts ? spectrum.fullScaleCounts : 1 }
 
     private var yDomain: ClosedRange<Double> {
         if fullScaleY {
-            return 0...(HR4000.maxCounts * 1.02) / countScale
+            return 0...(spectrum.fullScaleCounts * 1.02) / countScale
         }
         let fallback = max(spectrum.counts.max() ?? 0, 10) / countScale * 1.12
         return 0...(yTop > 0 ? yTop : fallback)
@@ -408,18 +408,17 @@ private struct ChartInteractionOverlay: View {
                     .position(x: plotFrame.minX + x, y: plotFrame.minY + y)
                     .allowsHitTesting(false)
 
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("\(hover.wavelengthNm, format: .number.precision(.fractionLength(2))) nm")
-                    Text(normalized
-                         ? "\(hover.counts, format: .number.precision(.fractionLength(3)))"
-                         : "\(hover.counts, format: .number.precision(.fractionLength(1))) counts")
-                        .foregroundStyle(.secondary)
-                }
+                // Fixed field widths and monospaced digits keep the readout
+                // from shifting as digit counts change.
+                Text(String(
+                    format: normalized ? "λ=%7.2f, y=%5.3f" : "λ=%7.2f, y=%7.1f",
+                    hover.wavelengthNm, hover.counts))
                 .font(.system(.callout, design: .monospaced))
-                .padding(8)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 6))
                 .padding(10)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                 .allowsHitTesting(false)
             }
         }

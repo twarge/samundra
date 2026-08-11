@@ -49,7 +49,7 @@ func run() throws {
         let maxValue = values.max() ?? 0
         let mean = values.reduce(0, +) / Double(values.count)
         let maxIndex = values.indices.max(by: { values[$0] < values[$1] }) ?? 0
-        let darkPixels = Array(values[HR4000.darkPixelRange])
+        let darkPixels = Array(values[device.info.darkPixels])
         let darkMean = darkPixels.reduce(0, +) / Double(darkPixels.count)
 
         print(String(

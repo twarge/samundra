@@ -93,7 +93,7 @@ private actor AcquisitionEngine {
     }
 
     private func resetGroup() {
-        accumulator = [Double](repeating: 0, count: HR4000.pixelCount)
+        accumulator = [Double](repeating: 0, count: device.info.wavelengths.count)
         accumulated = 0
         groupSaturated = false
     }
@@ -121,10 +121,11 @@ private actor AcquisitionEngine {
                     groupScans = settings.scansToAverage
                     groupOptions = settings.options
                 }
-                for i in 0..<HR4000.pixelCount {
+                for i in 0..<min(raw.count, accumulator.count) {
                     accumulator[i] += Double(raw[i])
                 }
-                if Double(raw[HR4000.firstSignalPixel...].max() ?? 0) >= HR4000.maxCounts {
+                let first = device.info.firstSignalPixel
+                if Double(raw[first...].max() ?? 0) >= device.info.fullScaleCounts {
                     groupSaturated = true
                 }
                 accumulated += 1
@@ -157,7 +158,8 @@ private actor AcquisitionEngine {
         let processed = SpectrumProcessing.process(
             raw: averaged,
             options: groupOptions,
-            nonlinearityCoefficients: device.info.nonlinearityCoefficients)
+            nonlinearityCoefficients: device.info.nonlinearityCoefficients,
+            darkPixels: device.info.darkPixels)
 
         let now = Date()
         if let last = lastGroupEnd {
@@ -171,6 +173,7 @@ private actor AcquisitionEngine {
 
         let info = device.info!
         let trim = groupOptions.trimMaskedPixels
+        let first = info.firstSignalPixel
         let spectrum = Spectrum(
             device: .init(
                 model: info.model,
@@ -186,12 +189,13 @@ private actor AcquisitionEngine {
                     && info.nonlinearityCoefficients != nil,
                 saturated: groupSaturated),
             wavelengthsNm: trim
-                ? Array(info.wavelengths[HR4000.firstSignalPixel...])
+                ? Array(info.wavelengths[first...])
                 : info.wavelengths,
             counts: trim
-                ? Array(processed[HR4000.firstSignalPixel...])
+                ? Array(processed[first...])
                 : processed,
-            firstSignalIndex: trim ? 0 : HR4000.firstSignalPixel)
+            firstSignalIndex: trim ? 0 : first,
+            fullScaleCounts: info.fullScaleCounts)
         resetGroup()
 
         // Cap UI updates to ~25 Hz.
@@ -220,6 +224,11 @@ final class SpectrometerService: ObservableObject {
     @Published private(set) var latestSpectrum: Spectrum?
     @Published private(set) var acquisitionRate: Double?
     @Published private(set) var lastError: String?
+
+    /// Pausing freezes the *display*: acquisition keeps running, but
+    /// `latestSpectrum` stops updating, so the frozen frame can be saved or
+    /// copied. Unpausing shows live data again on the next frame.
+    @Published var isPaused = false
 
     @Published var integrationMillis: Double = 100 {
         didSet {
@@ -271,6 +280,8 @@ final class SpectrometerService: ObservableObject {
     private var engine: AcquisitionEngine?
     private var connecting = false
     private var connectionTask: Task<Void, Never>?
+    private var engineStartedAt: Date?
+    private var lastSpectrumAt: Date?
 
     init() {
         samundraLog.info("SpectrometerService started; polling for HR4000")
@@ -303,6 +314,7 @@ final class SpectrometerService: ObservableObject {
         }
         connectionTask = Task { [weak self] in
             while !Task.isCancelled {
+                self?.checkForStalledAcquisition()
                 await self?.attemptConnectIfNeeded()
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
             }
@@ -358,17 +370,7 @@ final class SpectrometerService: ObservableObject {
     }
 
     private func handleUnplug() {
-        settings.running = false
-        engine = nil
-        isAcquiring = false
-        acquisitionRate = nil
-        if let old = device {
-            device = nil
-            usbQueue.async { old.close() }
-        }
-        deviceInfo = nil
-        connection = .searching
-        lastError = "Spectrometer disconnected."
+        recycleConnection(reason: "Spectrometer disconnected.")
     }
 
     // MARK: Acquisition control
@@ -385,8 +387,11 @@ final class SpectrometerService: ObservableObject {
             settings: settings,
             onSpectrum: { [weak self] spectrum, rate in
                 guard let self else { return }
-                self.latestSpectrum = spectrum
+                self.lastSpectrumAt = Date()
                 if let rate { self.acquisitionRate = rate }
+                if !self.isPaused {
+                    self.latestSpectrum = spectrum
+                }
             },
             onStopped: { [weak self] in
                 self?.isAcquiring = false
@@ -404,8 +409,46 @@ final class SpectrometerService: ObservableObject {
         self.engine = engine
         lastError = nil
         isAcquiring = true
+        engineStartedAt = Date()
+        lastSpectrumAt = nil
         settings.running = true
         Task { await engine.start() }
+    }
+
+    /// Connected spectrometers must produce frames. If the engine has died
+    /// (any error path) or no spectrum has arrived within the expected frame
+    /// time plus margin, recycle the connection — reopening runs the full
+    /// clear/reconfigure/reset recovery ladder.
+    private func checkForStalledAcquisition() {
+        guard connection == .connected else { return }
+        if !isAcquiring {
+            recycleConnection(reason: lastError ?? "Acquisition stopped unexpectedly.")
+            return
+        }
+        let expectedFrameSeconds = integrationMillis / 1000 * Double(scansToAverage)
+        let timeout = expectedFrameSeconds * 2 + 8
+        if let reference = lastSpectrumAt ?? engineStartedAt,
+           Date().timeIntervalSince(reference) > timeout {
+            recycleConnection(reason: "The spectrometer stopped sending data.")
+        }
+    }
+
+    private func recycleConnection(reason: String) {
+        samundraLog.error("\(reason, privacy: .public) Resetting the connection.")
+        settings.running = false
+        engine = nil
+        isAcquiring = false
+        acquisitionRate = nil
+        engineStartedAt = nil
+        lastSpectrumAt = nil
+        if let old = device {
+            device = nil
+            old.cancelInFlightTransfers()
+            usbQueue.async { old.close() }
+        }
+        deviceInfo = nil
+        connection = .searching
+        lastError = reason
     }
 
     func stopRecording() {

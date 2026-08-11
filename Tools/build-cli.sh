@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 mkdir -p build
 swiftc -O \
     apps/Samundra/Sources/HR4000.swift \
+    apps/Samundra/Sources/SpectrometerModels.swift \
     apps/Samundra/Sources/HR4000Device.swift \
     apps/Samundra/Sources/Spectrum.swift \
     apps/Samundra/Sources/SpectrumProcessing.swift \

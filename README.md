@@ -25,7 +25,8 @@ spectrometer directly over USB with Apple's `IOUSBHost` framework.
 - Integration time (3.8 ms – 10 s), scan averaging, and boxcar smoothing
 - Electric-dark and detector-nonlinearity corrections using the calibration
   stored in the instrument's EEPROM
-- Recording is automatic whenever a spectrometer is connected
+- Recording is automatic whenever a spectrometer is connected; Space (or the
+  toolbar button) pauses and resumes, and Escape returns focus to the chart
 - Save (⌘S) writes a plain two-column `.csv` file (`wavelength,amplitude`
   with a header line); ⌘C or right-click ▸ Copy Data puts the same CSV on
   the clipboard
