@@ -16,6 +16,9 @@ struct SamundraApp: App {
         }
         .defaultSize(width: 1060, height: 660)
         .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("About Samundra") { AboutPanel.show() }
+            }
             SpectrumCommands(service: service)
         }
     }
