@@ -58,6 +58,21 @@ struct SidebarView: View {
                 Toggle("Nonlinearity", isOn: $service.nonlinearity)
                     .disabled(service.deviceInfo?.nonlinearityCoefficients == nil)
                     .help("Applies the detector linearity polynomial from the EEPROM")
+
+                LabeledContent("Wavelength offset") {
+                    HStack(spacing: 4) {
+                        TextField(
+                            "Wavelength offset",
+                            value: $service.wavelengthOffsetNm,
+                            format: .number.precision(.fractionLength(0...3)))
+                        .labelsHidden()
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 64)
+                        Text("nm")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .help("Added to the displayed and saved wavelengths to compensate calibration drift")
             }
 
             Section("Peaks") {

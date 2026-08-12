@@ -10,6 +10,9 @@ struct ProcessingOptions: Equatable {
     /// Drop the detector's dummy and optically masked leading pixels from the
     /// recorded spectrum (they carry no optical signal).
     var trimMaskedPixels = true
+    /// Added to the EEPROM-calibrated wavelengths to compensate instrument
+    /// drift; applies to everything downstream, including saved files.
+    var wavelengthOffsetNm = 0.0
 }
 
 enum SpectrumProcessing {

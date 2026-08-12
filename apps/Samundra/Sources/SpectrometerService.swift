@@ -174,6 +174,10 @@ private actor AcquisitionEngine {
         let info = device.info!
         let trim = groupOptions.trimMaskedPixels
         let first = info.firstSignalPixel
+        let offset = groupOptions.wavelengthOffsetNm
+        let wavelengths = offset == 0
+            ? info.wavelengths
+            : info.wavelengths.map { $0 + offset }
         let spectrum = Spectrum(
             device: .init(
                 model: info.model,
@@ -189,8 +193,8 @@ private actor AcquisitionEngine {
                     && info.nonlinearityCoefficients != nil,
                 saturated: groupSaturated),
             wavelengthsNm: trim
-                ? Array(info.wavelengths[first...])
-                : info.wavelengths,
+                ? Array(wavelengths[first...])
+                : wavelengths,
             counts: trim
                 ? Array(processed[first...])
                 : processed,
@@ -236,7 +240,7 @@ final class SpectrometerService: ObservableObject {
                               HR4000.integrationMillisPractical.upperBound)
             if clamped != integrationMillis { integrationMillis = clamped }
             settings.integrationMicros = UInt32(clamped * 1000)
-            UserDefaults.standard.set(clamped, forKey: "integrationMillis")
+            UserDefaults.standard.set(clamped, forKey: key("integrationMillis"))
         }
     }
     @Published var scansToAverage = 1 {
@@ -244,24 +248,24 @@ final class SpectrometerService: ObservableObject {
             let clamped = min(max(scansToAverage, 1), 1000)
             if clamped != scansToAverage { scansToAverage = clamped }
             settings.scansToAverage = clamped
-            UserDefaults.standard.set(clamped, forKey: "scansToAverage")
+            UserDefaults.standard.set(clamped, forKey: key("scansToAverage"))
         }
     }
     @Published var electricDark = true {
         didSet {
-            UserDefaults.standard.set(electricDark, forKey: "electricDark")
+            UserDefaults.standard.set(electricDark, forKey: key("electricDark"))
             pushOptions()
         }
     }
     @Published var nonlinearity = true {
         didSet {
-            UserDefaults.standard.set(nonlinearity, forKey: "nonlinearity")
+            UserDefaults.standard.set(nonlinearity, forKey: key("nonlinearity"))
             pushOptions()
         }
     }
     @Published var trimMaskedPixels: Bool {
         didSet {
-            UserDefaults.standard.set(trimMaskedPixels, forKey: "trimMaskedPixels")
+            UserDefaults.standard.set(trimMaskedPixels, forKey: key("trimMaskedPixels"))
             pushOptions()
         }
     }
@@ -269,7 +273,15 @@ final class SpectrometerService: ObservableObject {
         didSet {
             let clamped = min(max(boxcarWidth, 0), 50)
             if clamped != boxcarWidth { boxcarWidth = clamped }
-            UserDefaults.standard.set(clamped, forKey: "boxcarWidth")
+            UserDefaults.standard.set(clamped, forKey: key("boxcarWidth"))
+            pushOptions()
+        }
+    }
+    @Published var wavelengthOffsetNm = 0.0 {
+        didSet {
+            let clamped = min(max(wavelengthOffsetNm, -50), 50)
+            if clamped != wavelengthOffsetNm { wavelengthOffsetNm = clamped }
+            UserDefaults.standard.set(clamped, forKey: key("wavelengthOffsetNm"))
             pushOptions()
         }
     }
@@ -278,6 +290,9 @@ final class SpectrometerService: ObservableObject {
     private let settings = AcquisitionSettings()
     private var device: HR4000Device?
     private var engine: AcquisitionEngine?
+    /// Instrument settings are stored per device, keyed by serial number;
+    /// before anything connects, the bare (legacy) keys act as defaults.
+    private var deviceKeyPrefix = ""
     private var connecting = false
     private var connectionTask: Task<Void, Never>?
     private var engineStartedAt: Date?
@@ -301,6 +316,9 @@ final class SpectrometerService: ObservableObject {
         }
         if let value = defaults.object(forKey: "electricDark") as? Bool { electricDark = value }
         if let value = defaults.object(forKey: "nonlinearity") as? Bool { nonlinearity = value }
+        if let value = defaults.object(forKey: "wavelengthOffsetNm") as? Double {
+            wavelengthOffsetNm = min(max(value, -50), 50)
+        }
         settings.integrationMicros = UInt32(integrationMillis * 1000)
         settings.scansToAverage = scansToAverage
         pushOptions()
@@ -321,12 +339,58 @@ final class SpectrometerService: ObservableObject {
         }
     }
 
+    private func key(_ name: String) -> String { deviceKeyPrefix + name }
+
+    /// Switch to the connected device's settings namespace and load its
+    /// stored values. A device seen for the first time inherits the current
+    /// settings and diverges from there.
+    private func adoptSettings(forSerial serial: String) {
+        deviceKeyPrefix = "device.\(serial)."
+        let defaults = UserDefaults.standard
+        if let value = defaults.object(forKey: key("integrationMillis")) as? Double {
+            integrationMillis = value
+        } else {
+            defaults.set(integrationMillis, forKey: key("integrationMillis"))
+        }
+        if let value = defaults.object(forKey: key("scansToAverage")) as? Int {
+            scansToAverage = value
+        } else {
+            defaults.set(scansToAverage, forKey: key("scansToAverage"))
+        }
+        if let value = defaults.object(forKey: key("boxcarWidth")) as? Int {
+            boxcarWidth = value
+        } else {
+            defaults.set(boxcarWidth, forKey: key("boxcarWidth"))
+        }
+        if let value = defaults.object(forKey: key("electricDark")) as? Bool {
+            electricDark = value
+        } else {
+            defaults.set(electricDark, forKey: key("electricDark"))
+        }
+        if let value = defaults.object(forKey: key("nonlinearity")) as? Bool {
+            nonlinearity = value
+        } else {
+            defaults.set(nonlinearity, forKey: key("nonlinearity"))
+        }
+        if let value = defaults.object(forKey: key("trimMaskedPixels")) as? Bool {
+            trimMaskedPixels = value
+        } else {
+            defaults.set(trimMaskedPixels, forKey: key("trimMaskedPixels"))
+        }
+        if let value = defaults.object(forKey: key("wavelengthOffsetNm")) as? Double {
+            wavelengthOffsetNm = min(max(value, -50), 50)
+        } else {
+            defaults.set(wavelengthOffsetNm, forKey: key("wavelengthOffsetNm"))
+        }
+    }
+
     private func pushOptions() {
         settings.options = ProcessingOptions(
             electricDark: electricDark,
             nonlinearity: nonlinearity,
             boxcarWidth: boxcarWidth,
-            trimMaskedPixels: trimMaskedPixels)
+            trimMaskedPixels: trimMaskedPixels,
+            wavelengthOffsetNm: wavelengthOffsetNm)
     }
 
     // MARK: Connection
@@ -353,6 +417,7 @@ final class SpectrometerService: ObservableObject {
             }
             device = opened
             deviceInfo = opened.info
+            adoptSettings(forSerial: opened.info.serialNumber)
             connection = .connected
             lastError = nil
             startAcquiring()
