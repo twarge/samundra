@@ -25,7 +25,8 @@ struct SamundraApp: App {
 }
 
 struct SpectrumCommands: Commands {
-    let service: SpectrometerService
+    // Observed so the Share item's enabled state tracks spectrum arrival.
+    @ObservedObject var service: SpectrometerService
 
     var body: some Commands {
         CommandGroup(replacing: .saveItem) {
@@ -33,6 +34,10 @@ struct SpectrumCommands: Commands {
                 save()
             }
             .keyboardShortcut("s", modifiers: .command)
+            Button("Share…") {
+                share()
+            }
+            .disabled(service.latestSpectrum == nil)
         }
         // When a text field has focus its own Copy item is enabled and wins;
         // otherwise this one fires on ⌘C.
@@ -59,6 +64,26 @@ struct SpectrumCommands: Commands {
         } catch {
             NSAlert(error: error).runModal()
         }
+    }
+
+    // A real file rather than a pasteboard item, so receivers get
+    // "Spectrum.csv"; a unique directory keeps repeated shares apart.
+    @MainActor
+    private func share() {
+        guard let spectrum = service.latestSpectrum,
+              let anchor = NSApp.keyWindow?.contentView else { return }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let url = directory.appendingPathComponent("Spectrum.csv")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try spectrum.csvData().write(to: url)
+        } catch {
+            NSAlert(error: error).runModal()
+            return
+        }
+        NSSharingServicePicker(items: [url])
+            .show(relativeTo: .zero, of: anchor, preferredEdge: .minY)
     }
 }
 
