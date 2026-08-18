@@ -10,6 +10,6 @@ swiftc -O \
     apps/Samundra/Sources/Spectrum.swift \
     apps/Samundra/Sources/SpectrumProcessing.swift \
     Tools/hr4000-capture/main.swift \
-    -framework IOUSBHost \
+    -framework IOKit \
     -o build/hr4000-capture
 echo "Built build/hr4000-capture"

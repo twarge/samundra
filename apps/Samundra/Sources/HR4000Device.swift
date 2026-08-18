@@ -1,13 +1,20 @@
-// User-space USB driver for the Ocean Optics HR4000, built on IOUSBHost.
+// User-space USB driver for the legacy Ocean Optics spectrometer family
+// (see SpectrometerModels.swift), built on IOKit's IOUSBLib plug-in
+// interfaces. IOUSBLib rather than IOUSBHost because the App Sandbox's
+// com.apple.security.device.usb entitlement covers IOUSBLib's user clients
+// but not IOUSBHost's AppleUSBHostFramework*Client classes, whose
+// temporary-exception entitlements App Review declines to grant.
 // All methods perform blocking I/O — confine calls to a single serial queue.
 
 import Foundation
 import IOKit
-import IOUSBHost
+import IOKit.usb
+import IOKit.usb.IOUSBLib
 
 enum HR4000Error: LocalizedError {
     case deviceNotFound
     case interfaceNotFound
+    case openFailed(String)
     case pipeUnavailable(Int)
     case transferFailed(String, underlying: Error?)
     case shortTransfer(expected: Int, got: Int)
@@ -22,6 +29,8 @@ enum HR4000Error: LocalizedError {
             return "No supported spectrometer found on USB."
         case .interfaceNotFound:
             return "The spectrometer\u{2019}s USB interface did not appear after configuration."
+        case .openFailed(let detail):
+            return detail
         case .pipeUnavailable(let address):
             return String(format: "USB endpoint 0x%02X is unavailable.", address)
         case .transferFailed(let what, let underlying):
@@ -58,18 +67,18 @@ final class HR4000Device: @unchecked Sendable {
         let fullScaleCounts: Double
     }
 
-    private let device: IOUSBHostDevice
-    private let interface: IOUSBHostInterface
-    private let commandOut: IOUSBHostPipe
-    private let replyIn: IOUSBHostPipe
-    private let spectrumIn: IOUSBHostPipe
-    private let spectrumFirstIn: IOUSBHostPipe?
+    private typealias DeviceRef =
+        UnsafeMutablePointer<UnsafeMutablePointer<IOUSBDeviceInterface>?>
+    private typealias InterfaceRef =
+        UnsafeMutablePointer<UnsafeMutablePointer<IOUSBInterfaceInterface>?>
 
-    private let spectrumBufferFirst: NSMutableData?
-    private let spectrumBufferRest: NSMutableData
-    private let replyBuffer: NSMutableData
-    private let requestSpectrumBuffer: NSMutableData
-    private var commandBuffers: [Int: NSMutableData] = [:]
+    private let interface: InterfaceRef
+    /// IOUSBLib's 1-based pipe references for the instrument's endpoints.
+    private let commandOutPipe: UInt8
+    private let replyInPipe: UInt8
+    private let spectrumInPipe: UInt8
+    /// Present only on 4K-class models that enumerated at high speed.
+    private let spectrumFirstInPipe: UInt8?
 
     private(set) var info: Info!
     private let model: SpectrometerModel
@@ -79,19 +88,57 @@ final class HR4000Device: @unchecked Sendable {
 
     /// Fired (on an internal queue) when the device is unplugged.
     var onTermination: (@Sendable () -> Void)? {
-        get { terminationRelay.handler }
-        set { terminationRelay.handler = newValue }
+        get { termination.handler }
+        set { termination.handler = newValue }
     }
-    private let terminationRelay: TerminationRelay
+    private let termination: TerminationWatcher
 
-    /// The IOUSBHost interest callback fires on a private queue; the handler
-    /// reference is lock-guarded.
-    private final class TerminationRelay: @unchecked Sendable {
+    /// Fires the handler when the device's kernel service is terminated,
+    /// i.e. the spectrometer is unplugged. The interest callback runs on a
+    /// private queue; the handler reference is lock-guarded.
+    private final class TerminationWatcher: @unchecked Sendable {
+        private let queue = DispatchQueue(label: "com.twarge.samundra.usb.termination")
+        private var port: IONotificationPortRef?
+        private var notification: io_object_t = IO_OBJECT_NULL
         private let lock = NSLock()
         private var _handler: (@Sendable () -> Void)?
         var handler: (@Sendable () -> Void)? {
             get { lock.withLock { _handler } }
             set { lock.withLock { _handler = newValue } }
+        }
+
+        func watch(_ service: io_service_t) {
+            guard let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
+            IONotificationPortSetDispatchQueue(port, queue)
+            self.port = port
+            // The refcon keeps self alive until invalidate().
+            let refcon = Unmanaged.passRetained(self).toOpaque()
+            let result = IOServiceAddInterestNotification(
+                port, service, kIOGeneralInterest,
+                { refcon, _, messageType, _ in
+                    // 0xE0000010 = kIOMessageServiceIsTerminated
+                    guard let refcon, messageType == 0xE000_0010 else { return }
+                    Unmanaged<TerminationWatcher>.fromOpaque(refcon)
+                        .takeUnretainedValue().handler?()
+                },
+                refcon, &notification)
+            if result != KERN_SUCCESS {
+                IONotificationPortDestroy(port)
+                self.port = nil
+                Unmanaged<TerminationWatcher>.fromOpaque(refcon).release()
+            }
+        }
+
+        func invalidate() {
+            guard let port else { return }
+            self.port = nil
+            handler = nil
+            IOObjectRelease(notification)
+            notification = IO_OBJECT_NULL
+            IONotificationPortDestroy(port)
+            // Callbacks run serially on `queue`: releasing the watch()
+            // retain there guarantees no in-flight callback outlives self.
+            queue.async { Unmanaged.passUnretained(self).release() }
         }
     }
 
@@ -129,92 +176,75 @@ final class HR4000Device: @unchecked Sendable {
     }
 
     private static func findService() -> io_service_t {
-        let matching = IOUSBHostDevice.__createMatchingDictionary(
-            withVendorID: NSNumber(value: HR4000.vendorID),
-            productID: nil,
-            bcdDevice: nil,
-            deviceClass: nil,
-            deviceSubclass: nil,
-            deviceProtocol: nil,
-            speed: nil,
-            productIDArray: SpectrometerModel.supported.map { NSNumber(value: $0.productID) })
-        return IOServiceGetMatchingService(kIOMainPortDefault, matching.takeRetainedValue())
+        guard let matching = IOServiceMatching("IOUSBHostDevice") else { return IO_OBJECT_NULL }
+        // IOUSBHostDevice honours only particular combinations of matching
+        // properties; vendor+product-array is one of them.
+        let properties = matching as NSMutableDictionary
+        properties["idVendor"] = HR4000.vendorID
+        properties["idProductArray"] = SpectrometerModel.supported.map { $0.productID }
+        return IOServiceGetMatchingService(kIOMainPortDefault, matching)
     }
 
-    /// Port-level USB reset. The kernel service is terminated and re-created,
-    /// so any open `HR4000Device` is dead afterwards.
+    /// Port-level USB reset via re-enumeration. The kernel service is
+    /// terminated and re-created, so any open `HR4000Device` is dead
+    /// afterwards.
     static func reset() throws {
         let service = findService()
         guard service != IO_OBJECT_NULL else { throw HR4000Error.deviceNotFound }
         defer { IOObjectRelease(service) }
-        let device = try IOUSBHostDevice(
-            __ioService: service, options: [], queue: nil, interestHandler: nil)
-        defer { device.destroy() }
-        try device.reset()
+        let device = try deviceInterface(for: service)
+        defer { _ = device.pointee?.pointee.Release(device) }
+
+        let openResult = device.pointee?.pointee.USBDeviceOpen(device) ?? KERN_FAILURE
+        guard openResult == kIOReturnSuccess else {
+            throw HR4000Error.openFailed(
+                String(format: "Couldn't open the spectrometer to reset it (0x%08X).", openResult))
+        }
+        defer { _ = device.pointee?.pointee.USBDeviceClose(device) }
+
+        let result = device.pointee?.pointee.USBDeviceReEnumerate(device, 0) ?? KERN_FAILURE
+        guard result == kIOReturnSuccess else {
+            throw HR4000Error.openFailed(
+                String(format: "USB reset failed (0x%08X).", result))
+        }
     }
 
     private init(service: io_service_t, forceConfigure: Bool = false) throws {
-        let relay = TerminationRelay()
-        terminationRelay = relay
         usbProductName = IORegistryEntryCreateCFProperty(
             service, "USB Product Name" as CFString, kCFAllocatorDefault, 0)?
             .takeRetainedValue() as? String
-        // kIOMessageServiceIsTerminated
-        let terminatedMessage: UInt32 = 0xE000_0010
 
-        device = try IOUSBHostDevice(
-            __ioService: service,
-            options: [],
-            queue: nil,
-            interestHandler: { _, messageType, _ in
-                if messageType == terminatedMessage {
-                    relay.handler?()
-                }
-            })
-
-        guard let descriptor = device.deviceDescriptor,
-              let matched = SpectrometerModel.forProductID(Int(descriptor.pointee.idProduct))
-        else {
-            device.destroy()
-            throw HR4000Error.deviceNotFound
-        }
+        guard let productID = Self.numberProperty(service, "idProduct"),
+              let matched = SpectrometerModel.forProductID(productID)
+        else { throw HR4000Error.deviceNotFound }
         model = matched
 
-        do {
-            if forceConfigure || device.configurationDescriptor == nil {
-                try device.__configure(withValue: 1, matchInterfaces: true)
-            }
-            let interfaceService = try Self.waitForInterfaceService(of: device)
-            interface = try IOUSBHostInterface(
-                __ioService: interfaceService, options: [], queue: nil, interestHandler: nil)
-            IOObjectRelease(interfaceService)
-        } catch {
-            device.destroy()
-            throw error
+        // macOS normally auto-configures the device on attach; forcing
+        // re-sends SET_CONFIGURATION, which resets every endpoint.
+        if forceConfigure || Self.currentConfiguration(of: service) == 0 {
+            try Self.configure(service)
         }
 
+        let interfaceService = try Self.waitForInterfaceService(of: service)
+        defer { IOObjectRelease(interfaceService) }
+        let interface = try Self.openInterface(interfaceService)
+
         do {
-            commandOut = try Self.pipe(HR4000.Endpoint.commandOut, on: interface)
-            replyIn = try Self.pipe(HR4000.Endpoint.replyIn, on: interface)
-            spectrumIn = try Self.pipe(HR4000.Endpoint.spectrumIn, on: interface)
-            spectrumFirstIn = model.usesSecondSpectrumEndpoint
-                ? try? interface.copyPipe(withAddress: HR4000.Endpoint.spectrumFirstIn)
+            let pipes = try Self.mapPipes(on: interface)
+            commandOutPipe = pipes.commandOut
+            replyInPipe = pipes.replyIn
+            spectrumInPipe = pipes.spectrumIn
+            spectrumFirstInPipe = matched.usesSecondSpectrumEndpoint
+                ? pipes.spectrumFirstIn
                 : nil
-
-            replyBuffer = try interface.ioData(withCapacity: 64)
-            requestSpectrumBuffer = try interface.ioData(withCapacity: 1)
-            spectrumBufferFirst = spectrumFirstIn == nil
-                ? nil
-                : try interface.ioData(withCapacity: HR4000.highSpeedFirstChunk)
-            let restLength = spectrumFirstIn == nil
-                ? model.rawSpectrumLength
-                : model.rawSpectrumLength - HR4000.highSpeedFirstChunk
-            spectrumBufferRest = try interface.ioData(withCapacity: restLength)
         } catch {
-            interface.destroy()
-            device.destroy()
+            _ = interface.pointee?.pointee.USBInterfaceClose(interface)
+            _ = interface.pointee?.pointee.Release(interface)
             throw error
         }
+        self.interface = interface
+        termination = TerminationWatcher()
+        termination.watch(service)
 
         do {
             try initializeSpectrometer()
@@ -224,12 +254,116 @@ final class HR4000Device: @unchecked Sendable {
         }
     }
 
-    private static func waitForInterfaceService(of device: IOUSBHostDevice) throws -> io_service_t {
+    func close() {
+        guard !closed else { return }
+        closed = true
+        termination.invalidate()
+        _ = interface.pointee?.pointee.USBInterfaceClose(interface)
+        _ = interface.pointee?.pointee.Release(interface)
+    }
+
+    deinit {
+        close()
+    }
+
+    // MARK: - IOUSBLib plumbing
+
+    // CFUUIDs for the CFPlugIn dance, computed to stay clear of Swift 6
+    // shared-state rules; CFUUIDGetConstantUUIDWithBytes returns registry
+    // singletons.
+    private static var plugInInterfaceID: CFUUID {  // kIOCFPlugInInterfaceID
+        CFUUIDGetConstantUUIDWithBytes(
+            nil, 0xC2, 0x44, 0xE8, 0x58, 0x10, 0x9C, 0x11, 0xD4,
+            0x91, 0xD4, 0x00, 0x50, 0xE4, 0xC6, 0x42, 0x6F)
+    }
+    private static var deviceUserClientTypeID: CFUUID {  // kIOUSBDeviceUserClientTypeID
+        CFUUIDGetConstantUUIDWithBytes(
+            nil, 0x9D, 0xC7, 0xB7, 0x80, 0x9E, 0xC0, 0x11, 0xD4,
+            0xA5, 0x4F, 0x00, 0x0A, 0x27, 0x05, 0x28, 0x61)
+    }
+    private static var deviceInterfaceID: CFUUID {  // kIOUSBDeviceInterfaceID942
+        CFUUIDGetConstantUUIDWithBytes(
+            nil, 0x56, 0xAD, 0x08, 0x9D, 0x87, 0x8D, 0x4B, 0xEA,
+            0xA1, 0xF5, 0x2C, 0x8D, 0xC4, 0x3E, 0x8A, 0x98)
+    }
+    private static var interfaceUserClientTypeID: CFUUID {  // kIOUSBInterfaceUserClientTypeID
+        CFUUIDGetConstantUUIDWithBytes(
+            nil, 0x2D, 0x97, 0x86, 0xC6, 0x9E, 0xF3, 0x11, 0xD4,
+            0xAD, 0x51, 0x00, 0x0A, 0x27, 0x05, 0x28, 0x61)
+    }
+    private static var interfaceInterfaceID: CFUUID {  // kIOUSBInterfaceInterfaceID942
+        CFUUIDGetConstantUUIDWithBytes(
+            nil, 0x87, 0x52, 0x66, 0x3B, 0xC0, 0x7B, 0x4B, 0xAE,
+            0x95, 0x84, 0x22, 0x03, 0x2F, 0xAB, 0x9C, 0x5A)
+    }
+
+    private static func numberProperty(_ service: io_service_t, _ key: String) -> Int? {
+        guard
+            let value = IORegistryEntryCreateCFProperty(
+                service, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+        else { return nil }
+        return (value as? NSNumber)?.intValue
+    }
+
+    private static func deviceInterface(for service: io_service_t) throws -> DeviceRef {
+        var plugIn: UnsafeMutablePointer<UnsafeMutablePointer<IOCFPlugInInterface>?>?
+        var score: Int32 = 0
+        let plugInResult = IOCreatePlugInInterfaceForService(
+            service, deviceUserClientTypeID, plugInInterfaceID, &plugIn, &score)
+        guard plugInResult == KERN_SUCCESS, let plugIn else {
+            throw HR4000Error.openFailed(
+                String(format: "USB device plug-in unavailable (0x%08X).", plugInResult))
+        }
+        defer { _ = plugIn.pointee?.pointee.Release(plugIn) }
+
+        var raw: LPVOID?
+        let queryResult = withUnsafeMutablePointer(to: &raw) { pointer in
+            plugIn.pointee?.pointee.QueryInterface(
+                plugIn, CFUUIDGetUUIDBytes(deviceInterfaceID), pointer) ?? KERN_FAILURE
+        }
+        guard queryResult == S_OK, let raw else {
+            throw HR4000Error.openFailed("USB device interface unavailable.")
+        }
+        return DeviceRef(OpaquePointer(raw))
+    }
+
+    /// The device's current configuration value; 0 means unconfigured.
+    private static func currentConfiguration(of service: io_service_t) -> UInt8 {
+        guard let device = try? deviceInterface(for: service) else { return 0 }
+        defer { _ = device.pointee?.pointee.Release(device) }
+        var config: UInt8 = 0
+        guard device.pointee?.pointee.GetConfiguration(device, &config) == kIOReturnSuccess
+        else { return 0 }
+        return config
+    }
+
+    private static func configure(_ service: io_service_t) throws {
+        let device = try deviceInterface(for: service)
+        defer { _ = device.pointee?.pointee.Release(device) }
+
+        let openResult = device.pointee?.pointee.USBDeviceOpen(device) ?? KERN_FAILURE
+        guard openResult == kIOReturnSuccess else {
+            throw HR4000Error.openFailed(
+                openResult == kIOReturnExclusiveAccess
+                    ? "The spectrometer is in use by another app."
+                    : String(format: "Couldn't open the spectrometer (0x%08X).", openResult))
+        }
+        defer { _ = device.pointee?.pointee.USBDeviceClose(device) }
+
+        let result = device.pointee?.pointee.SetConfigurationV2(device, 1, true, false)
+            ?? KERN_FAILURE
+        guard result == kIOReturnSuccess else {
+            throw HR4000Error.openFailed(
+                String(format: "SET_CONFIGURATION failed (0x%08X).", result))
+        }
+    }
+
+    private static func waitForInterfaceService(of device: io_service_t) throws -> io_service_t {
         // Interfaces register asynchronously after SET_CONFIGURATION.
         for attempt in 0..<25 {
             if attempt > 0 { usleep(100_000) }
             var iterator = io_iterator_t()
-            guard IORegistryEntryGetChildIterator(device.ioService, kIOServicePlane, &iterator)
+            guard IORegistryEntryGetChildIterator(device, kIOServicePlane, &iterator)
                 == KERN_SUCCESS else { continue }
             defer { IOObjectRelease(iterator) }
             var child = IOIteratorNext(iterator)
@@ -244,24 +378,75 @@ final class HR4000Device: @unchecked Sendable {
         throw HR4000Error.interfaceNotFound
     }
 
-    private static func pipe(_ address: Int, on interface: IOUSBHostInterface) throws -> IOUSBHostPipe {
-        do {
-            return try interface.copyPipe(withAddress: address)
-        } catch {
-            throw HR4000Error.pipeUnavailable(address)
+    private static func openInterface(_ service: io_service_t) throws -> InterfaceRef {
+        var plugIn: UnsafeMutablePointer<UnsafeMutablePointer<IOCFPlugInInterface>?>?
+        var score: Int32 = 0
+        let plugInResult = IOCreatePlugInInterfaceForService(
+            service, interfaceUserClientTypeID, plugInInterfaceID, &plugIn, &score)
+        guard plugInResult == KERN_SUCCESS, let plugIn else {
+            throw HR4000Error.openFailed(
+                String(format: "USB interface plug-in unavailable (0x%08X).", plugInResult))
         }
+        defer { _ = plugIn.pointee?.pointee.Release(plugIn) }
+
+        var raw: LPVOID?
+        let queryResult = withUnsafeMutablePointer(to: &raw) { pointer in
+            plugIn.pointee?.pointee.QueryInterface(
+                plugIn, CFUUIDGetUUIDBytes(interfaceInterfaceID), pointer) ?? KERN_FAILURE
+        }
+        guard queryResult == S_OK, let raw else {
+            throw HR4000Error.interfaceNotFound
+        }
+        let interface = InterfaceRef(OpaquePointer(raw))
+
+        // Claim the interface. This is the call the sandbox blocks under
+        // IOUSBHost but permits here.
+        let openResult = interface.pointee?.pointee.USBInterfaceOpen(interface) ?? KERN_FAILURE
+        guard openResult == kIOReturnSuccess else {
+            _ = interface.pointee?.pointee.Release(interface)
+            throw HR4000Error.openFailed(
+                openResult == kIOReturnExclusiveAccess
+                    ? "The spectrometer is in use by another app."
+                    : String(format: "Couldn't claim the spectrometer interface (0x%08X).", openResult))
+        }
+        return interface
     }
 
-    func close() {
-        guard !closed else { return }
-        closed = true
-        onTermination = nil
-        interface.destroy()
-        device.destroy()
-    }
+    /// Maps the instrument's endpoint addresses to IOUSBLib's 1-based pipe
+    /// references.
+    private static func mapPipes(on interface: InterfaceRef) throws
+        -> (commandOut: UInt8, replyIn: UInt8, spectrumIn: UInt8, spectrumFirstIn: UInt8?)
+    {
+        var endpointCount: UInt8 = 0
+        guard interface.pointee?.pointee.GetNumEndpoints(interface, &endpointCount)
+            == kIOReturnSuccess, endpointCount > 0
+        else { throw HR4000Error.interfaceNotFound }
 
-    deinit {
-        close()
+        var byAddress: [Int: UInt8] = [:]
+        for pipe in 1...endpointCount {
+            var direction: UInt8 = 0
+            var number: UInt8 = 0
+            var transferType: UInt8 = 0
+            var maxPacketSize: UInt16 = 0
+            var interval: UInt8 = 0
+            guard interface.pointee?.pointee.GetPipeProperties(
+                interface, pipe, &direction, &number, &transferType,
+                &maxPacketSize, &interval) == kIOReturnSuccess
+            else { continue }
+            // direction: 0 = out, 1 = in (kUSBOut / kUSBIn)
+            byAddress[Int(number) | (direction == 1 ? 0x80 : 0x00)] = pipe
+        }
+
+        guard let commandOut = byAddress[HR4000.Endpoint.commandOut] else {
+            throw HR4000Error.pipeUnavailable(HR4000.Endpoint.commandOut)
+        }
+        guard let replyIn = byAddress[HR4000.Endpoint.replyIn] else {
+            throw HR4000Error.pipeUnavailable(HR4000.Endpoint.replyIn)
+        }
+        guard let spectrumIn = byAddress[HR4000.Endpoint.spectrumIn] else {
+            throw HR4000Error.pipeUnavailable(HR4000.Endpoint.spectrumIn)
+        }
+        return (commandOut, replyIn, spectrumIn, byAddress[HR4000.Endpoint.spectrumFirstIn])
     }
 
     // MARK: - Initialization sequence
@@ -274,7 +459,7 @@ final class HR4000Device: @unchecked Sendable {
         usleep(200_000)
 
         let status = try queryStatus()
-        let highSpeed = status?.usbHighSpeed ?? (spectrumFirstIn != nil)
+        let highSpeed = status?.usbHighSpeed ?? (spectrumFirstInPipe != nil)
 
         try setTriggerMode(0)
         try setIntegrationTime(microseconds: integrationMicros)
@@ -341,7 +526,8 @@ final class HR4000Device: @unchecked Sendable {
 
     func queryStatus() throws -> HR4000.Status? {
         try send([HR4000.Command.queryStatus])
-        let data = try read(replyIn, into: replyBuffer, timeout: 1.0)
+        let data = try read(replyInPipe, endpoint: HR4000.Endpoint.replyIn,
+                            maxLength: 64, timeout: 1.0)
         return HR4000.Status(data)
     }
 
@@ -350,7 +536,8 @@ final class HR4000Device: @unchecked Sendable {
         for _ in 0..<2 {
             do {
                 try send([HR4000.Command.queryInformation, slot])
-                let data = try read(replyIn, into: replyBuffer, timeout: 1.0)
+                let data = try read(replyInPipe, endpoint: HR4000.Endpoint.replyIn,
+                                    maxLength: 64, timeout: 1.0)
                 guard data.count >= 3, data[0] == HR4000.Command.queryInformation,
                       data[1] == slot else {
                     throw HR4000Error.eepromReadFailed(slot: slot)
@@ -369,19 +556,23 @@ final class HR4000Device: @unchecked Sendable {
     // MARK: - Spectrum acquisition
 
     /// Acquire one spectrum. Returns the active pixels (XOR mask applied),
-    /// values in ADC counts 0...16383.
+    /// values in ADC counts.
     func acquireSpectrum() throws -> [UInt16] {
-        try send([HR4000.Command.requestSpectrum], buffer: requestSpectrumBuffer)
+        try send([HR4000.Command.requestSpectrum])
 
         let timeout = Double(integrationMicros) / 1e6 + 2.0
         var raw = Data(capacity: model.rawSpectrumLength)
         do {
-            if let firstPipe = spectrumFirstIn, let firstBuffer = spectrumBufferFirst {
-                raw.append(try read(firstPipe, into: firstBuffer, timeout: timeout,
+            if let firstPipe = spectrumFirstInPipe {
+                raw.append(try read(firstPipe, endpoint: HR4000.Endpoint.spectrumFirstIn,
+                                    maxLength: HR4000.highSpeedFirstChunk, timeout: timeout,
                                     expect: HR4000.highSpeedFirstChunk))
             }
-            raw.append(try read(spectrumIn, into: spectrumBufferRest, timeout: timeout,
-                                expect: spectrumBufferRest.length))
+            let restLength = spectrumFirstInPipe == nil
+                ? model.rawSpectrumLength
+                : model.rawSpectrumLength - HR4000.highSpeedFirstChunk
+            raw.append(try read(spectrumInPipe, endpoint: HR4000.Endpoint.spectrumIn,
+                                maxLength: restLength, timeout: timeout, expect: restLength))
         } catch {
             try? resynchronize()
             throw error
@@ -410,76 +601,79 @@ final class HR4000Device: @unchecked Sendable {
     /// throws, and the next `resynchronize()` restores framing.
     func cancelInFlightTransfers() {
         guard !closed else { return }
-        for pipe in [spectrumFirstIn, spectrumIn].compactMap({ $0 }) {
-            try? pipe.__abort(with: .synchronous)
+        for pipe in [spectrumFirstInPipe, spectrumInPipe].compactMap({ $0 }) {
+            _ = interface.pointee?.pointee.AbortPipe(interface, pipe)
         }
     }
 
     /// Abort and drain the pipes after an error so framing recovers.
     func resynchronize() throws {
-        for pipe in [commandOut, spectrumFirstIn, spectrumIn, replyIn].compactMap({ $0 }) {
-            try? pipe.__abort(with: .synchronous)
-            try? pipe.clearStall()
+        guard !closed else { return }
+        for pipe in [commandOutPipe, spectrumFirstInPipe, spectrumInPipe, replyInPipe]
+            .compactMap({ $0 })
+        {
+            _ = interface.pointee?.pointee.AbortPipe(interface, pipe)
+            _ = interface.pointee?.pointee.ClearPipeStallBothEnds(interface, pipe)
         }
         // Drain any stale packets left over from an interrupted spectrum.
-        let drainBuffer = try interface.ioData(withCapacity: 512)
-        for pipe in [spectrumFirstIn, spectrumIn].compactMap({ $0 }) {
+        var drain = [UInt8](repeating: 0, count: 512)
+        for pipe in [spectrumFirstInPipe, spectrumInPipe].compactMap({ $0 }) {
             for _ in 0..<20 {
-                var transferred = 0
-                do {
-                    try pipe.__sendIORequest(
-                        with: drainBuffer, bytesTransferred: &transferred, completionTimeout: 0.05)
-                } catch {
-                    break
+                var size = UInt32(drain.count)
+                let result = drain.withUnsafeMutableBytes { buffer -> IOReturn in
+                    interface.pointee?.pointee.ReadPipeTO(
+                        interface, pipe, buffer.baseAddress, &size, 50, 50) ?? KERN_FAILURE
                 }
-                if transferred == 0 { break }
+                if result != kIOReturnSuccess || size == 0 { break }
             }
         }
     }
 
     // MARK: - Low-level I/O
 
-    private func send(_ bytes: [UInt8], buffer: NSMutableData? = nil) throws {
+    /// Wraps an IOReturn for HR4000Error's `underlying` payload, preserving
+    /// the code SpectrometerService checks for disconnects.
+    private static func ioError(_ code: IOReturn) -> NSError {
+        NSError(
+            domain: NSMachErrorDomain,
+            code: Int(UInt32(bitPattern: code)),
+            userInfo: [NSLocalizedDescriptionKey: String(format: "IOKit error 0x%08X", code)])
+    }
+
+    private func send(_ bytes: [UInt8]) throws {
         guard !closed else { throw HR4000Error.disconnected }
-        let data: NSMutableData
-        if let buffer, buffer.length == bytes.count {
-            data = buffer
-        } else if let cached = commandBuffers[bytes.count] {
-            data = cached
-        } else {
-            data = try interface.ioData(withCapacity: bytes.count)
-            commandBuffers[bytes.count] = data
+        var payload = bytes
+        let result = payload.withUnsafeMutableBytes { buffer -> IOReturn in
+            interface.pointee?.pointee.WritePipeTO(
+                interface, commandOutPipe, buffer.baseAddress, UInt32(buffer.count),
+                1_000, 1_000) ?? KERN_FAILURE
         }
-        bytes.withUnsafeBytes { source in
-            data.mutableBytes.copyMemory(from: source.baseAddress!, byteCount: bytes.count)
-        }
-        var transferred = 0
-        do {
-            try commandOut.__sendIORequest(with: data, bytesTransferred: &transferred, completionTimeout: 1.0)
-        } catch {
+        guard result == kIOReturnSuccess else {
             throw HR4000Error.transferFailed(
-                String(format: "command 0x%02X", bytes[0]), underlying: error)
-        }
-        guard transferred == bytes.count else {
-            throw HR4000Error.shortTransfer(expected: bytes.count, got: transferred)
+                String(format: "command 0x%02X", bytes[0]), underlying: Self.ioError(result))
         }
     }
 
     private func read(
-        _ pipe: IOUSBHostPipe, into buffer: NSMutableData, timeout: TimeInterval,
+        _ pipe: UInt8, endpoint: Int, maxLength: Int, timeout: TimeInterval,
         expect: Int? = nil
     ) throws -> Data {
         guard !closed else { throw HR4000Error.disconnected }
-        var transferred = 0
-        do {
-            try pipe.__sendIORequest(with: buffer, bytesTransferred: &transferred, completionTimeout: timeout)
-        } catch {
+        var buffer = [UInt8](repeating: 0, count: maxLength)
+        var size = UInt32(maxLength)
+        let milliseconds = UInt32(max(1, timeout * 1000))
+        let result = buffer.withUnsafeMutableBytes { raw -> IOReturn in
+            interface.pointee?.pointee.ReadPipeTO(
+                interface, pipe, raw.baseAddress, &size, milliseconds, milliseconds)
+                ?? KERN_FAILURE
+        }
+        guard result == kIOReturnSuccess else {
             throw HR4000Error.transferFailed(
-                String(format: "read 0x%02lX", pipe.endpointAddress), underlying: error)
+                String(format: "read 0x%02X", endpoint), underlying: Self.ioError(result))
         }
-        if let expect, transferred != expect {
-            throw HR4000Error.shortTransfer(expected: expect, got: transferred)
+        if let expect, Int(size) != expect {
+            throw HR4000Error.shortTransfer(expected: expect, got: Int(size))
         }
-        return Data(bytes: buffer.mutableBytes, count: transferred)
+        return Data(buffer.prefix(Int(size)))
     }
 }

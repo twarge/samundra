@@ -42,7 +42,7 @@ final class AcquisitionSettings: @unchecked Sendable {
 
 /// Runs the blocking acquisition loop. The actor's executor is the USB
 /// dispatch queue itself, so every isolated method — including the blocking
-/// IOUSBHost calls — runs on that queue's thread, never on the cooperative
+/// IOUSBLib calls — runs on that queue's thread, never on the cooperative
 /// pool, and the compiler now enforces the confinement the queue used to
 /// provide by convention.
 private actor AcquisitionEngine {

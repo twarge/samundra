@@ -6,7 +6,7 @@ spectrometer and the window shows the live spectrum; Save (⌘S) writes
 whatever was last acquired.
 
 No vendor drivers or third-party libraries are required. The app talks to the
-spectrometer directly over USB with Apple's `IOUSBHost` framework.
+spectrometer directly over USB with IOKit's `IOUSBLib` plug-in interfaces.
 
 ## Features
 
@@ -71,10 +71,12 @@ cross-checked against [python-seabreeze](https://github.com/ap--/python-seabreez
 
 ### Sandbox note
 
-The app is sandboxed. `com.apple.security.device.usb` alone does not cover the
-`IOUSBHost` framework's user clients (`AppleUSBHostFrameworkDeviceClient` /
-`AppleUSBHostFrameworkInterfaceClient`), so the entitlements add a
-`temporary-exception.iokit-user-client-class` for them.
+The app is sandboxed with only `com.apple.security.device.usb`. USB access
+goes through IOKit's legacy `IOUSBLib` plug-in interfaces rather than the
+`IOUSBHost` framework: the sandbox's USB entitlement covers IOUSBLib's user
+clients, while IOUSBHost's (`AppleUSBHostFrameworkDeviceClient` /
+`AppleUSBHostFrameworkInterfaceClient`) would need temporary-exception
+entitlements that Mac App Store review does not grant.
 
 ## Data attribution
 

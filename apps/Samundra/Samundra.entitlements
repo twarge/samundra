@@ -6,13 +6,6 @@
 	<true/>
 	<key>com.apple.security.device.usb</key>
 	<true/>
-	<!-- com.apple.security.device.usb does not yet cover the IOUSBHost
-	     framework user clients; these exceptions restore access. -->
-	<key>com.apple.security.temporary-exception.iokit-user-client-class</key>
-	<array>
-		<string>AppleUSBHostFrameworkDeviceClient</string>
-		<string>AppleUSBHostFrameworkInterfaceClient</string>
-	</array>
 	<key>com.apple.security.files.user-selected.read-write</key>
 	<true/>
 </dict>
