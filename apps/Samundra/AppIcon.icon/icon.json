@@ -1,0 +1,60 @@
+{
+  "fill-specializations" : [
+    {
+      "value" : {
+        "linear-gradient" : [
+          "extended-srgb:0.07500,0.11000,0.20000,1.00000",
+          "extended-srgb:0.02000,0.03000,0.06000,1.00000"
+        ]
+      }
+    },
+    {
+      "appearance" : "dark",
+      "value" : {
+        "linear-gradient" : [
+          "extended-srgb:0.05500,0.08500,0.16500,1.00000",
+          "extended-srgb:0.01000,0.01500,0.03500,1.00000"
+        ]
+      }
+    }
+  ],
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "image-name" : "Trace.svg",
+          "name" : "Trace"
+        }
+      ],
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
+      }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "Area.svg",
+          "name" : "Area",
+          "opacity" : 0.45
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.0
+      },
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : "shared"
+  }
+}

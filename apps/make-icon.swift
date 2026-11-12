@@ -1,43 +1,51 @@
 #!/usr/bin/env swift
-// Renders the app icon: an emission spectrum — the trace the whole app is
-// about — glowing across a deep-sea night, samundra being the sea.
+// Writes the app icon as an Icon Composer bundle: an emission spectrum — the
+// trace the whole app is about — glowing across a deep-sea night, samundra
+// being the sea.
 //
-//     swift apps/make-icon.swift
+//     swift apps/make-icon.swift        (or: make icon)
 //
-// writes AppIcon-1024.png into the asset catalog. Full-bleed square: the
-// platform applies its own mask.
+// The output is apps/Samundra/AppIcon.icon: icon.json plus one SVG per layer.
+// Xcode's asset compiler turns it into every size the platform needs and
+// applies the system shape and the glass, dark, clear and tinted treatments,
+// so the artwork here is full bleed and carries no mask, rim, shadow or glow
+// of its own.
+//
+// Layers, front to back, over the night-sea fill (which the dark appearance
+// keeps, a shade deeper):
+//
+//     Trace   the spectrum line, violet to red (glass; its shadow takes the
+//             layer's colour, which is the glow)
+//     Area    the fill under the line, the same ramp, dimmer (flat)
+//
+// The bundle is committed, so this only needs running when the design
+// changes. To look at the result without building:
+//
+//     "/Applications/Xcode.app/Contents/Applications/Icon Composer.app/Contents/Executables/ictool" \
+//         apps/Samundra/AppIcon.icon --export-image --output-file icon.png \
+//         --platform macOS --rendition Default --width 512 --height 512 --scale 2
+//
+// Renditions: Default, Dark, TintedLight, TintedDark, ClearLight, ClearDark.
 
-import AppKit
-import UniformTypeIdentifiers
+import Foundation
 
-let side = 1024
-let outPath = "apps/Samundra/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png"
+let outDir = "apps/Samundra/AppIcon.icon"
 
 guard FileManager.default.fileExists(atPath: "apps/Samundra") else {
     fatalError("run from the repository root")
 }
 
-let space = CGColorSpace(name: CGColorSpace.sRGB)!
-let ctx = CGContext(
-    data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
-    space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+// MARK: Geometry, on the 1024 × 1024 canvas with y downward
 
-// The sea at night: near-black depths, a suggestion of blue toward the top.
-let background = CGGradient(
-    colorsSpace: space,
-    colors: [
-        CGColor(srgbRed: 0.075, green: 0.110, blue: 0.200, alpha: 1),
-        CGColor(srgbRed: 0.020, green: 0.030, blue: 0.060, alpha: 1),
-    ] as CFArray,
-    locations: [0, 1])!
-ctx.drawLinearGradient(
-    background,
-    start: CGPoint(x: CGFloat(side) / 2, y: CGFloat(side)),
-    end: CGPoint(x: CGFloat(side) / 2, y: 0),
-    options: [])
+let side = 1024.0
+let inset = 0.10 * side              // breathing room inside the system shape
+let plotWidth = side - 2 * inset
+let baseline = 0.78 * side           // y of zero signal
+let amplitude = 0.58 * side          // height of a full-scale peak
+let traceWidth = 20.0
 
-// The trace: a few emission lines of different strengths on a low baseline,
-// the same profile a gas-discharge lamp draws in the app.
+// The trace: a few emission lines of different strengths on a low
+// background, the same profile a gas-discharge lamp draws in the app.
 struct Peak { let center: Double; let height: Double; let width: Double }
 let peaks = [
     Peak(center: 0.18, height: 0.42, width: 0.022),
@@ -47,8 +55,9 @@ let peaks = [
     Peak(center: 0.72, height: 0.50, width: 0.020),
     Peak(center: 0.86, height: 0.26, width: 0.028),
 ]
+let background = 0.035
 func profile(_ t: Double) -> Double {
-    var y = 0.035
+    var y = background
     for p in peaks {
         let d = (t - p.center) / p.width
         y += p.height * exp(-d * d / 2)
@@ -56,73 +65,148 @@ func profile(_ t: Double) -> Double {
     return min(y, 1)
 }
 
-let inset = 0.10 * Double(side)          // breathing room inside the mask
-let plotWidth = Double(side) - 2 * inset
-let baseline = 0.22 * Double(side)
-let amplitude = 0.58 * Double(side)
+func num(_ v: Double) -> String {
+    let s = String(format: "%.1f", v)
+    return s.hasSuffix(".0") ? String(s.dropLast(2)) : s
+}
 
-let path = CGMutablePath()
-path.move(to: CGPoint(x: inset, y: baseline))
 let steps = 512
-for i in 0...steps {
+let tracePoints: [String] = (0...steps).map { i in
     let t = Double(i) / Double(steps)
-    path.addLine(to: CGPoint(x: inset + t * plotWidth, y: baseline + profile(t) * amplitude))
+    return "\(num(inset + t * plotWidth)),\(num(baseline - profile(t) * amplitude))"
 }
-path.addLine(to: CGPoint(x: inset + plotWidth, y: baseline))
-path.closeSubpath()
 
-// Visible-spectrum ramp, violet to red across the trace.
-func rampColor(_ t: Double) -> CGColor {
-    let nm = 395.0 + t * (675.0 - 395.0)
-    var r = 0.0, g = 0.0, b = 0.0
-    switch nm {
-    case ..<440: r = (440 - nm) / 60; b = 1
-    case ..<490: g = (nm - 440) / 50; b = 1
-    case ..<510: g = 1; b = (510 - nm) / 20
-    case ..<580: r = (nm - 510) / 70; g = 1
-    case ..<645: r = 1; g = (645 - nm) / 65
-    default: r = 1
+// MARK: Colour
+
+// Visible-spectrum ramp, violet to red across the trace: 395 nm to 675 nm,
+// linear in sRGB between the classic primaries.
+let ramp: [(nm: Double, hex: String)] = [
+    (395, "#BF00FF"),
+    (440, "#0000FF"),
+    (490, "#00FFFF"),
+    (510, "#00FF00"),
+    (580, "#FFFF00"),
+    (645, "#FF0000"),
+    (675, "#FF0000"),
+]
+let rampStops = ramp.map { stop -> String in
+    let offset = String(format: "%.4f", (stop.nm - 395) / (675 - 395))
+    return "      <stop offset=\"\(offset)\" stop-color=\"\(stop.hex)\"/>"
+}
+let rampDef = (
+    ["  <defs>",
+     "    <linearGradient id=\"ramp\" gradientUnits=\"userSpaceOnUse\" "
+        + "x1=\"\(num(inset))\" y1=\"0\" x2=\"\(num(inset + plotWidth))\" y2=\"0\">"]
+    + rampStops
+    + ["    </linearGradient>", "  </defs>"]
+).joined(separator: "\n")
+
+// The sea at night: a suggestion of blue at the top, near-black depths. The
+// dark appearance gets its own, deeper pair; left to itself the system would
+// swap the fill for its neutral charcoal there and the sea would be gone.
+let sea = ["extended-srgb:0.07500,0.11000,0.20000,1.00000", "extended-srgb:0.02000,0.03000,0.06000,1.00000"]
+let seaDark = ["extended-srgb:0.05500,0.08500,0.16500,1.00000", "extended-srgb:0.01000,0.01500,0.03500,1.00000"]
+
+// MARK: Layers
+
+func svg(_ body: String) -> String {
+    """
+    <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+    \(rampDef)
+    \(body)
+    </svg>
+
+    """
+}
+
+func wrapped(_ points: [String], indent: String) -> String {
+    stride(from: 0, to: points.count, by: 10)
+        .map { indent + points[$0..<min($0 + 10, points.count)].joined(separator: " ") }
+        .joined(separator: "\n")
+}
+
+let trace = svg("""
+      <polyline fill="none" stroke="url(#ramp)" stroke-width="\(num(traceWidth))" stroke-linecap="round" stroke-linejoin="round" points="
+    \(wrapped(tracePoints, indent: "    "))"/>
+    """)
+
+let areaPoints =
+    ["\(num(inset)),\(num(baseline))"] + tracePoints + ["\(num(inset + plotWidth)),\(num(baseline))"]
+let area = svg("""
+      <polygon fill="url(#ramp)" points="
+    \(wrapped(areaPoints, indent: "    "))"/>
+    """)
+
+let iconJSON = """
+    {
+      "fill-specializations" : [
+        {
+          "value" : {
+            "linear-gradient" : [
+              "\(sea[0])",
+              "\(sea[1])"
+            ]
+          }
+        },
+        {
+          "appearance" : "dark",
+          "value" : {
+            "linear-gradient" : [
+              "\(seaDark[0])",
+              "\(seaDark[1])"
+            ]
+          }
+        }
+      ],
+      "groups" : [
+        {
+          "layers" : [
+            {
+              "image-name" : "Trace.svg",
+              "name" : "Trace"
+            }
+          ],
+          "shadow" : {
+            "kind" : "layer-color",
+            "opacity" : 0.5
+          },
+          "translucency" : {
+            "enabled" : false,
+            "value" : 0.5
+          }
+        },
+        {
+          "layers" : [
+            {
+              "glass" : false,
+              "image-name" : "Area.svg",
+              "name" : "Area",
+              "opacity" : 0.45
+            }
+          ],
+          "shadow" : {
+            "kind" : "neutral",
+            "opacity" : 0.0
+          },
+          "translucency" : {
+            "enabled" : false,
+            "value" : 0.5
+          }
+        }
+      ],
+      "supported-platforms" : {
+        "squares" : "shared"
+      }
     }
-    return CGColor(srgbRed: r, green: g, blue: b, alpha: 1)
-}
-let stops = 64
-let ramp = CGGradient(
-    colorsSpace: space,
-    colors: (0...stops).map { rampColor(Double($0) / Double(stops)) } as CFArray,
-    locations: (0...stops).map { CGFloat($0) / CGFloat(stops) })!
 
-// Fill under the trace, dimmer, like the area style in the app…
-ctx.saveGState()
-ctx.addPath(path)
-ctx.clip()
-ctx.setAlpha(0.45)
-ctx.drawLinearGradient(
-    ramp,
-    start: CGPoint(x: inset, y: 0),
-    end: CGPoint(x: inset + plotWidth, y: 0),
-    options: [])
-ctx.restoreGState()
+    """
 
-// …then the trace itself at full strength with a soft glow.
-ctx.saveGState()
-ctx.setLineWidth(16)
-ctx.setLineJoin(.round)
-ctx.setShadow(
-    offset: .zero, blur: 42,
-    color: CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.55))
-ctx.addPath(path)
-ctx.replacePathWithStrokedPath()
-ctx.clip()
-ctx.drawLinearGradient(
-    ramp,
-    start: CGPoint(x: inset, y: 0),
-    end: CGPoint(x: inset + plotWidth, y: 0),
-    options: [])
-ctx.restoreGState()
+// MARK: Output
 
-let image = ctx.makeImage()!
-let dest = CGImageDestinationCreateWithURL(
-    URL(fileURLWithPath: outPath) as CFURL, UTType.png.identifier as CFString, 1, nil)!
-CGImageDestinationAddImage(dest, image, nil)
-CGImageDestinationFinalize(dest)
-print("wrote \(outPath)")
+let fm = FileManager.default
+try? fm.removeItem(atPath: outDir)
+try fm.createDirectory(atPath: outDir + "/Assets", withIntermediateDirectories: true)
+try trace.write(toFile: outDir + "/Assets/Trace.svg", atomically: true, encoding: .utf8)
+try area.write(toFile: outDir + "/Assets/Area.svg", atomically: true, encoding: .utf8)
+try iconJSON.write(toFile: outDir + "/icon.json", atomically: true, encoding: .utf8)
+print("wrote \(outDir)")
