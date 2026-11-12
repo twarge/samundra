@@ -20,6 +20,12 @@
 //     Area    everything under the line down to the bottom edge, the same
 //             ramp, dimmer (flat)
 //
+// The tinted and clear appearances reduce a layer to its brightness, and a
+// rainbow's brightness is uneven: blue comes out far darker than yellow, in
+// bands. So for those appearances each layer has a second image, the same
+// shape in one neutral tone (Trace-Mono, Area-Mono). Default and dark use
+// the colour.
+//
 // The bundle is committed, so this only needs running when the design
 // changes. To look at the result without building:
 //
@@ -112,6 +118,9 @@ let rampDef = (
     + ["    </linearGradient>", "  </defs>"]
 ).joined(separator: "\n")
 
+// What stands in for the ramp in the tinted and clear appearances.
+let monoTone = "#AEAEAE"
+
 // The sea at night: a suggestion of blue at the top, near-black depths. The
 // dark appearance gets its own, deeper pair; left to itself the system would
 // swap the fill for its neutral charcoal there and the sea would be gone.
@@ -120,11 +129,13 @@ let seaDark = ["extended-srgb:0.05500,0.08500,0.16500,1.00000", "extended-srgb:0
 
 // MARK: Layers
 
+let rampPaint = "url(#ramp)"
+
 func svg(_ body: String) -> String {
-    """
+    let defs = body.contains(rampPaint) ? rampDef + "\n" : ""
+    return """
     <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-    \(rampDef)
-    \(body)
+    \(defs)\(body)
     </svg>
 
     """
@@ -136,17 +147,36 @@ func wrapped(_ points: [String], indent: String) -> String {
         .joined(separator: "\n")
 }
 
-let trace = svg("""
-      <polyline fill="none" stroke="url(#ramp)" stroke-width="\(num(traceWidth))" stroke-linecap="round" stroke-linejoin="round" points="
-    \(wrapped(tracePoints, indent: "    "))"/>
-    """)
+func trace(_ paint: String) -> String {
+    svg("""
+          <polyline fill="none" stroke="\(paint)" stroke-width="\(num(traceWidth))" stroke-linecap="round" stroke-linejoin="round" points="
+        \(wrapped(tracePoints, indent: "    "))"/>
+        """)
+}
 
 let areaPoints =
     ["\(num(-overhang)),\(num(side))"] + tracePoints + ["\(num(side + overhang)),\(num(side))"]
-let area = svg("""
-      <polygon fill="url(#ramp)" points="
-    \(wrapped(areaPoints, indent: "    "))"/>
-    """)
+func area(_ paint: String) -> String {
+    svg("""
+          <polygon fill="\(paint)" points="
+        \(wrapped(areaPoints, indent: "    "))"/>
+        """)
+}
+
+// Colour by default, the neutral tone when the system tints or clears.
+func images(_ name: String) -> String {
+    """
+    "image-name-specializations" : [
+                {
+                  "value" : "\(name).svg"
+                },
+                {
+                  "appearance" : "tinted",
+                  "value" : "\(name)-Mono.svg"
+                }
+              ]
+    """
+}
 
 let iconJSON = """
     {
@@ -173,7 +203,7 @@ let iconJSON = """
         {
           "layers" : [
             {
-              "image-name" : "Trace.svg",
+              \(images("Trace")),
               "name" : "Trace"
             }
           ],
@@ -190,7 +220,7 @@ let iconJSON = """
           "layers" : [
             {
               "glass" : false,
-              "image-name" : "Area.svg",
+              \(images("Area")),
               "name" : "Area",
               "opacity" : 0.45
             }
@@ -217,7 +247,9 @@ let iconJSON = """
 let fm = FileManager.default
 try? fm.removeItem(atPath: outDir)
 try fm.createDirectory(atPath: outDir + "/Assets", withIntermediateDirectories: true)
-try trace.write(toFile: outDir + "/Assets/Trace.svg", atomically: true, encoding: .utf8)
-try area.write(toFile: outDir + "/Assets/Area.svg", atomically: true, encoding: .utf8)
+try trace(rampPaint).write(toFile: outDir + "/Assets/Trace.svg", atomically: true, encoding: .utf8)
+try trace(monoTone).write(toFile: outDir + "/Assets/Trace-Mono.svg", atomically: true, encoding: .utf8)
+try area(rampPaint).write(toFile: outDir + "/Assets/Area.svg", atomically: true, encoding: .utf8)
+try area(monoTone).write(toFile: outDir + "/Assets/Area-Mono.svg", atomically: true, encoding: .utf8)
 try iconJSON.write(toFile: outDir + "/icon.json", atomically: true, encoding: .utf8)
 print("wrote \(outDir)")

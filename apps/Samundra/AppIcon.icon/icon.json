@@ -22,7 +22,15 @@
     {
       "layers" : [
         {
-          "image-name" : "Trace.svg",
+          "image-name-specializations" : [
+            {
+              "value" : "Trace.svg"
+            },
+            {
+              "appearance" : "tinted",
+              "value" : "Trace-Mono.svg"
+            }
+          ],
           "name" : "Trace"
         }
       ],
@@ -39,7 +47,15 @@
       "layers" : [
         {
           "glass" : false,
-          "image-name" : "Area.svg",
+          "image-name-specializations" : [
+            {
+              "value" : "Area.svg"
+            },
+            {
+              "appearance" : "tinted",
+              "value" : "Area-Mono.svg"
+            }
+          ],
           "name" : "Area",
           "opacity" : 0.45
         }
