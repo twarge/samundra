@@ -14,9 +14,11 @@
 // Layers, front to back, over the night-sea fill (which the dark appearance
 // keeps, a shade deeper):
 //
-//     Trace   the spectrum line, violet to red (glass; its shadow takes the
-//             layer's colour, which is the glow)
-//     Area    the fill under the line, the same ramp, dimmer (flat)
+//     Trace   the spectrum line, violet to red, running off both sides of
+//             the icon (glass; its shadow takes the layer's colour, which is
+//             the glow)
+//     Area    everything under the line down to the bottom edge, the same
+//             ramp, dimmer (flat)
 //
 // The bundle is committed, so this only needs running when the design
 // changes. To look at the result without building:
@@ -38,7 +40,7 @@ guard FileManager.default.fileExists(atPath: "apps/Samundra") else {
 // MARK: Geometry, on the 1024 × 1024 canvas with y downward
 
 let side = 1024.0
-let inset = 0.10 * side              // breathing room inside the system shape
+let inset = 0.10 * side              // keeps the peaks clear of the system shape
 let plotWidth = side - 2 * inset
 let baseline = 0.78 * side           // y of zero signal
 let amplitude = 0.58 * side          // height of a full-scale peak
@@ -70,16 +72,25 @@ func num(_ v: Double) -> String {
     return s.hasSuffix(".0") ? String(s.dropLast(2)) : s
 }
 
+// The peaks sit between the insets; the flat background on either side of
+// them carries on past the canvas, so the system shape cuts the line rather
+// than the line stopping short of it.
+let overhang = 2 * traceWidth
+func traceY(_ t: Double) -> Double { baseline - profile(t) * amplitude }
 let steps = 512
-let tracePoints: [String] = (0...steps).map { i in
-    let t = Double(i) / Double(steps)
-    return "\(num(inset + t * plotWidth)),\(num(baseline - profile(t) * amplitude))"
-}
+let tracePoints: [String] =
+    ["\(num(-overhang)),\(num(traceY(0)))"]
+    + (0...steps).map { i in
+        let t = Double(i) / Double(steps)
+        return "\(num(inset + t * plotWidth)),\(num(traceY(t)))"
+    }
+    + ["\(num(side + overhang)),\(num(traceY(1)))"]
 
 // MARK: Colour
 
-// Visible-spectrum ramp, violet to red across the trace: 395 nm to 675 nm,
-// linear in sRGB between the classic primaries.
+// Visible-spectrum ramp, violet to red across the peaks: 395 nm to 675 nm,
+// linear in sRGB between the classic primaries. Outside the insets the end
+// colours carry on to the edges.
 let ramp: [(nm: Double, hex: String)] = [
     (395, "#BF00FF"),
     (440, "#0000FF"),
@@ -131,7 +142,7 @@ let trace = svg("""
     """)
 
 let areaPoints =
-    ["\(num(inset)),\(num(baseline))"] + tracePoints + ["\(num(inset + plotWidth)),\(num(baseline))"]
+    ["\(num(-overhang)),\(num(side))"] + tracePoints + ["\(num(side + overhang)),\(num(side))"]
 let area = svg("""
       <polygon fill="url(#ramp)" points="
     \(wrapped(areaPoints, indent: "    "))"/>
