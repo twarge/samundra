@@ -5,7 +5,10 @@
 // but not IOUSBHost's AppleUSBHostFramework*Client classes, whose
 // temporary-exception entitlements App Review declines to grant.
 // All methods perform blocking I/O — confine calls to a single serial queue.
+// macOS only: other platforms have no IOKit USB access and view a remote
+// spectrometer instead (see RemoteSpectrometer.swift).
 
+#if os(macOS)
 import Foundation
 import IOKit
 import IOKit.usb
@@ -55,17 +58,7 @@ enum HR4000Error: LocalizedError {
 // Confinement: after `open()`, all I/O methods must be called from one serial
 // queue; `cancelInFlightTransfers()` and `close()` are safe from elsewhere.
 final class HR4000Device: @unchecked Sendable {
-    struct Info {
-        let model: String
-        let serialNumber: String
-        let wavelengthCoefficients: [Double]
-        let nonlinearityCoefficients: [Double]?
-        let wavelengths: [Double]
-        let usbHighSpeed: Bool
-        let darkPixels: Range<Int>
-        let firstSignalPixel: Int
-        let fullScaleCounts: Double
-    }
+    typealias Info = SpectrometerInfo
 
     private typealias DeviceRef =
         UnsafeMutablePointer<UnsafeMutablePointer<IOUSBDeviceInterface>?>
@@ -677,3 +670,4 @@ final class HR4000Device: @unchecked Sendable {
         return Data(buffer.prefix(Int(size)))
     }
 }
+#endif

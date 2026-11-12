@@ -18,8 +18,12 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
-	<key>LSMinimumSystemVersion</key>
-	<string>14.0</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_labcast._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Samundra uses the local network to share this Mac’s spectrometer with Samundra on your other devices, and to show a spectrometer shared by another Mac.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>ITSAppUsesNonExemptEncryption</key>

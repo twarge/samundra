@@ -1,3 +1,4 @@
+#if os(macOS)
 import AppKit
 
 /// Shows the standard About panel with a license notice in the credits area.
@@ -81,3 +82,4 @@ enum AboutPanel {
         return NSAttributedString(string: label, attributes: linkAttributes)
     }
 }
+#endif

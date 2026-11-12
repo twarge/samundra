@@ -1,7 +1,11 @@
-// Owns the HR4000 connection and the acquisition loop; acquisition runs
-// whenever a spectrometer is connected.
+// Owns the spectrometer the window shows — the HR4000 on this Mac's USB with
+// its acquisition loop, or a spectrometer another Mac publishes on the local
+// network — and, on the Mac that owns the hardware, publishes it to viewers.
+// Acquisition runs whenever a spectrometer is connected.
 
+#if os(macOS)
 import AppKit
+#endif
 import Combine
 import Foundation
 import os
@@ -39,6 +43,8 @@ final class AcquisitionSettings: @unchecked Sendable {
 }
 
 // MARK: - Acquisition engine
+
+#if os(macOS)
 
 /// Runs the blocking acquisition loop. The actor's executor is the USB
 /// dispatch queue itself, so every isolated method — including the blocking
@@ -211,6 +217,7 @@ private actor AcquisitionEngine {
         }
     }
 }
+#endif
 
 // MARK: - Service
 
@@ -222,50 +229,89 @@ final class SpectrometerService: ObservableObject {
         case failed(String)
     }
 
+    /// Where spectra come from: the spectrometer on this Mac's USB (`.local`;
+    /// on platforms without USB access it means "none"), or a spectrometer
+    /// another Mac publishes on the local network.
+    enum Source: Equatable {
+        case local
+        case remote(id: String, name: String)
+    }
+
     @Published private(set) var connection: ConnectionState = .searching
-    @Published private(set) var deviceInfo: HR4000Device.Info?
+    @Published private(set) var deviceInfo: SpectrometerInfo?
     @Published private(set) var isAcquiring = false
     @Published private(set) var latestSpectrum: Spectrum?
     @Published private(set) var acquisitionRate: Double?
     @Published private(set) var lastError: String?
+
+    @Published private(set) var source: Source = .local
+    /// Macs currently publishing a spectrometer on the local network.
+    @Published private(set) var remotePeers: [LabcastPeer] = []
+    /// Presented to a remote spectrometer that asks for a passcode.
+    @Published var remotePasscode = "" {
+        didSet { UserDefaults.standard.set(remotePasscode, forKey: "remotePasscode") }
+    }
+
+    var isRemote: Bool { source != .local }
 
     /// Pausing freezes the *display*: acquisition keeps running, but
     /// `latestSpectrum` stops updating, so the frozen frame can be saved or
     /// copied. Unpausing shows live data again on the next frame.
     @Published var isPaused = false
 
+    // With a remote spectrometer these mirror the publisher's settings.
+    // Integration time and averaging can be changed from here (the change is
+    // sent to the publisher as a request); the rest are read-only.
     @Published var integrationMillis: Double = 100 {
         didSet {
             let clamped = min(max(integrationMillis, HR4000.integrationMillisPractical.lowerBound),
                               HR4000.integrationMillisPractical.upperBound)
             if clamped != integrationMillis { integrationMillis = clamped }
+            guard !isRemote else {
+                if !applyingRemoteStatus, clamped != oldValue {
+                    sendToRemote { remote in
+                        let applied = try await remote.setIntegrationMillis(clamped)
+                        return { $0.integrationMillis = applied }
+                    }
+                }
+                return
+            }
             settings.integrationMicros = UInt32(clamped * 1000)
-            UserDefaults.standard.set(clamped, forKey: key("integrationMillis"))
+            persist(clamped, "integrationMillis")
         }
     }
     @Published var scansToAverage = 1 {
         didSet {
             let clamped = min(max(scansToAverage, 1), 1000)
             if clamped != scansToAverage { scansToAverage = clamped }
+            guard !isRemote else {
+                if !applyingRemoteStatus, clamped != oldValue {
+                    sendToRemote { remote in
+                        let applied = try await remote.setScansToAverage(clamped)
+                        return { $0.scansToAverage = applied }
+                    }
+                }
+                return
+            }
             settings.scansToAverage = clamped
-            UserDefaults.standard.set(clamped, forKey: key("scansToAverage"))
+            persist(clamped, "scansToAverage")
         }
     }
     @Published var electricDark = true {
         didSet {
-            UserDefaults.standard.set(electricDark, forKey: key("electricDark"))
+            persist(electricDark, "electricDark")
             pushOptions()
         }
     }
     @Published var nonlinearity = true {
         didSet {
-            UserDefaults.standard.set(nonlinearity, forKey: key("nonlinearity"))
+            persist(nonlinearity, "nonlinearity")
             pushOptions()
         }
     }
     @Published var trimMaskedPixels: Bool {
         didSet {
-            UserDefaults.standard.set(trimMaskedPixels, forKey: key("trimMaskedPixels"))
+            persist(trimMaskedPixels, "trimMaskedPixels")
             pushOptions()
         }
     }
@@ -273,7 +319,7 @@ final class SpectrometerService: ObservableObject {
         didSet {
             let clamped = min(max(boxcarWidth, 0), 50)
             if clamped != boxcarWidth { boxcarWidth = clamped }
-            UserDefaults.standard.set(clamped, forKey: key("boxcarWidth"))
+            persist(clamped, "boxcarWidth")
             pushOptions()
         }
     }
@@ -281,29 +327,109 @@ final class SpectrometerService: ObservableObject {
         didSet {
             let clamped = min(max(wavelengthOffsetNm, -50), 50)
             if clamped != wavelengthOffsetNm { wavelengthOffsetNm = clamped }
-            UserDefaults.standard.set(clamped, forKey: key("wavelengthOffsetNm"))
+            persist(clamped, "wavelengthOffsetNm")
             pushOptions()
         }
     }
 
-    private let usbQueue = DispatchSerialQueue(label: "com.twarge.samundra.usb", qos: .userInitiated)
     private let settings = AcquisitionSettings()
-    private var device: HR4000Device?
-    private var engine: AcquisitionEngine?
     /// Instrument settings are stored per device, keyed by serial number;
     /// before anything connects, the bare (legacy) keys act as defaults.
     private var deviceKeyPrefix = ""
+    private var lastSpectrumAt: Date?
+
+    private var remote: RemoteSpectrometer?
+    private var remoteLink: LabcastSubscriber.State = .idle
+    private var remoteStatus: RemoteStatus?
+    private var applyingRemoteStatus = false
+    private var browseTask: Task<Void, Never>?
+    /// The remote spectrometer in use when the app last quit; selected again
+    /// as soon as it is found on the network.
+    private var remoteNameToRestore: String?
+
+    #if os(macOS)
+    private let usbQueue = DispatchSerialQueue(label: "com.twarge.samundra.usb", qos: .userInitiated)
+    private var device: HR4000Device?
+    private var engine: AcquisitionEngine?
     private var connecting = false
     private var connectionTask: Task<Void, Never>?
     private var engineStartedAt: Date?
-    private var lastSpectrumAt: Date?
 
-    init() {
-        samundraLog.info("SpectrometerService started; polling for HR4000")
-        // Restore saved acquisition settings. Property observers do not fire
-        // during init, so the shared settings are synced explicitly below.
+    /// Whether this Mac offers its spectrometer to viewers on the local network.
+    @Published private(set) var isPublishing = false
+    /// Viewers must present the same passcode; empty means open.
+    @Published var publishPasscode = "" {
+        didSet { UserDefaults.standard.set(publishPasscode, forKey: "publishPasscode") }
+    }
+    @Published private(set) var publishError: String?
+    @Published private(set) var viewerCount = 0
+    /// The name viewers see for this Mac.
+    let publishName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+    private var broadcaster: SpectrumBroadcaster?
+    private var stateObserver: AnyCancellable?
+    private var statePublishScheduled = false
+    private var publishedStatus: RemoteStatus?
+    private var publishedDevice: RemoteDevice?
+    #endif
+
+    /// - Parameter autostart: Look for a USB spectrometer and for publishers
+    ///   on the network, and restore the previous session's source and
+    ///   sharing. The self-test passes `false` and connects by hand.
+    init(autostart: Bool = true) {
+        samundraLog.info("SpectrometerService started")
         let defaults = UserDefaults.standard
         trimMaskedPixels = (defaults.object(forKey: "trimMaskedPixels") as? Bool) ?? true
+        loadSavedSettings()
+        guard autostart else { return }
+
+        remotePasscode = defaults.string(forKey: "remotePasscode") ?? ""
+        remoteNameToRestore = defaults.string(forKey: "remoteSourceName")
+        browseTask = Task { [weak self] in
+            for await peers in LabcastBrowser.peers(appID: SpectrumWire.appID) {
+                guard let self else { return }
+                self.remotePeers = peers
+                self.restoreRemoteIfFound()
+            }
+        }
+
+        #if os(macOS)
+        // Quitting mid-acquisition would otherwise kill the process with a
+        // spectrum half-transferred — the main way the device gets wedged.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.shutdown() }
+        }
+        connectionTask = Task { [weak self] in
+            while !Task.isCancelled {
+                if self?.source == .local {
+                    self?.checkForStalledAcquisition()
+                    await self?.attemptConnectIfNeeded()
+                }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+        }
+        publishPasscode = defaults.string(forKey: "publishPasscode") ?? ""
+        isPublishing = defaults.bool(forKey: "publishEnabled")
+        updatePublishing()
+        #endif
+    }
+
+    private func key(_ name: String) -> String { deviceKeyPrefix + name }
+
+    /// Saves a local instrument setting. A remote spectrometer's settings
+    /// belong to its Mac and are not stored here.
+    private func persist(_ value: Any, _ name: String) {
+        guard !isRemote else { return }
+        UserDefaults.standard.set(value, forKey: key(name))
+    }
+
+    /// Load the settings saved before any device was identified (the bare
+    /// keys): at launch, and when coming back from a remote spectrometer.
+    private func loadSavedSettings() {
+        deviceKeyPrefix = ""
+        let defaults = UserDefaults.standard
+        if let value = defaults.object(forKey: "trimMaskedPixels") as? Bool { trimMaskedPixels = value }
         if let value = defaults.object(forKey: "integrationMillis") as? Double {
             integrationMillis = min(max(value, HR4000.integrationMillisPractical.lowerBound),
                                     HR4000.integrationMillisPractical.upperBound)
@@ -322,24 +448,282 @@ final class SpectrometerService: ObservableObject {
         settings.integrationMicros = UInt32(integrationMillis * 1000)
         settings.scansToAverage = scansToAverage
         pushOptions()
+    }
 
-        // Quitting mid-acquisition would otherwise kill the process with a
-        // spectrum half-transferred — the main way the device gets wedged.
-        NotificationCenter.default.addObserver(
-            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.shutdown() }
+    private func pushOptions() {
+        settings.options = ProcessingOptions(
+            electricDark: electricDark,
+            nonlinearity: nonlinearity,
+            boxcarWidth: boxcarWidth,
+            trimMaskedPixels: trimMaskedPixels,
+            wavelengthOffsetNm: wavelengthOffsetNm)
+    }
+
+    // MARK: Source selection
+
+    /// Use the spectrometer `peer` publishes instead of the local one.
+    func selectRemote(_ peer: LabcastPeer) {
+        remoteNameToRestore = nil
+        UserDefaults.standard.set(peer.name, forKey: "remoteSourceName")
+        connectRemote(
+            LabcastSubscriber(peer: peer, passcode: remotePasscode.isEmpty ? nil : remotePasscode),
+            id: peer.id, name: peer.name)
+    }
+
+    /// Go back to the spectrometer on this device's USB (or to none).
+    func selectLocal() {
+        remoteNameToRestore = nil
+        UserDefaults.standard.removeObject(forKey: "remoteSourceName")
+        guard isRemote else { return }
+        leaveSource()
+        source = .local
+        loadSavedSettings()
+        sourceChanged()
+    }
+
+    /// Connect again to the selected remote spectrometer, e.g. after the
+    /// passcode was edited.
+    func reconnectRemote() {
+        guard case .remote(let id, _) = source,
+              let peer = remotePeers.first(where: { $0.id == id }) else { return }
+        selectRemote(peer)
+    }
+
+    /// Makes the publisher behind `subscriber` the source. `selectRemote`
+    /// is the usual way in; the self-test connects by address.
+    func connectRemote(_ subscriber: LabcastSubscriber, id: String, name: String) {
+        leaveSource()
+        source = .remote(id: id, name: name)
+        sourceChanged()
+        let remote = RemoteSpectrometer(subscriber: subscriber)
+        remote.onEvent = { [weak self, weak remote] event in
+            guard let self, let remote, self.remote === remote else { return }
+            self.handle(event)
         }
-        connectionTask = Task { [weak self] in
-            while !Task.isCancelled {
-                self?.checkForStalledAcquisition()
-                await self?.attemptConnectIfNeeded()
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
+        self.remote = remote
+        remote.start()
+    }
+
+    private func restoreRemoteIfFound() {
+        guard let name = remoteNameToRestore, source == .local,
+              let peer = remotePeers.first(where: { $0.name == name }) else { return }
+        selectRemote(peer)
+    }
+
+    /// Detaches from the current source and clears what it was showing.
+    private func leaveSource() {
+        remote?.stop()
+        remote = nil
+        remoteStatus = nil
+        remoteLink = .idle
+        #if os(macOS)
+        closeDevice()
+        #endif
+        deviceInfo = nil
+        isAcquiring = false
+        acquisitionRate = nil
+        latestSpectrum = nil
+        lastSpectrumAt = nil
+        lastError = nil
+        isPaused = false
+        connection = .searching
+    }
+
+    private func sourceChanged() {
+        #if os(macOS)
+        updatePublishing()
+        #endif
+    }
+
+    // MARK: Remote spectrometer
+
+    private func handle(_ event: RemoteSpectrometer.Event) {
+        switch event {
+        case .link(let state):
+            remoteLink = state
+            refreshRemoteConnection()
+        case .device(let info):
+            deviceInfo = info
+        case .status(let status):
+            remoteStatus = status
+            apply(status)
+            refreshRemoteConnection()
+        case .spectrum(let spectrum, let rate):
+            lastSpectrumAt = Date()
+            acquisitionRate = rate
+            if !isPaused {
+                latestSpectrum = spectrum
             }
         }
     }
 
-    private func key(_ name: String) -> String { deviceKeyPrefix + name }
+    /// Show the publisher's settings. Assignments made here are not sent
+    /// back as requests.
+    private func apply(_ status: RemoteStatus) {
+        applyingRemoteStatus = true
+        defer { applyingRemoteStatus = false }
+        if integrationMillis != status.integrationMillis { integrationMillis = status.integrationMillis }
+        if scansToAverage != status.scansToAverage { scansToAverage = status.scansToAverage }
+        if boxcarWidth != status.boxcarWidth { boxcarWidth = status.boxcarWidth }
+        if electricDark != status.electricDark { electricDark = status.electricDark }
+        if nonlinearity != status.nonlinearity { nonlinearity = status.nonlinearity }
+        if trimMaskedPixels != status.trimMaskedPixels { trimMaskedPixels = status.trimMaskedPixels }
+        if wavelengthOffsetNm != status.wavelengthOffsetNm { wavelengthOffsetNm = status.wavelengthOffsetNm }
+    }
+
+    private func refreshRemoteConnection() {
+        guard case .remote(_, let name) = source else { return }
+        if case .connected = remoteLink, let status = remoteStatus {
+            switch status.connection {
+            case .connected: connection = .connected
+            case .searching: connection = .searching
+            case .failed: connection = .failed(status.failure ?? "The spectrometer failed to connect.")
+            }
+            isAcquiring = status.isAcquiring
+            lastError = status.lastError
+        } else {
+            connection = .searching
+            isAcquiring = false
+            acquisitionRate = nil
+            if case .waiting(let reason) = remoteLink {
+                lastError = "Cannot reach \(name): \(reason)"
+            } else {
+                lastError = nil
+            }
+        }
+    }
+
+    /// Sends a settings request to the publisher. `send` returns how to show
+    /// the value the publisher applied; if the request fails, the sidebar
+    /// goes back to the publisher's actual settings.
+    private func sendToRemote(
+        _ send: @escaping @MainActor (RemoteSpectrometer) async throws -> (SpectrometerService) -> Void
+    ) {
+        guard let remote else { return }
+        Task {
+            do {
+                let show = try await send(remote)
+                guard self.remote === remote else { return }
+                self.applyingRemoteStatus = true
+                show(self)
+                self.applyingRemoteStatus = false
+            } catch {
+                guard self.remote === remote else { return }
+                samundraLog.error("Remote setting change failed: \(String(describing: error), privacy: .public)")
+                self.lastError = "The remote spectrometer did not accept the change."
+                if let status = self.remoteStatus { self.apply(status) }
+            }
+        }
+    }
+
+    #if os(macOS)
+
+    // MARK: Publishing
+
+    /// Starts or stops offering this Mac's spectrometer on the local network.
+    func setPublishing(_ enabled: Bool) {
+        isPublishing = enabled
+        UserDefaults.standard.set(enabled, forKey: "publishEnabled")
+        publishError = nil
+        updatePublishing()
+    }
+
+    /// Only a Mac showing its own spectrometer publishes; one that is itself
+    /// viewing a remote spectrometer does not relay it.
+    private func updatePublishing() {
+        let wanted = isPublishing && !isRemote
+        if wanted, broadcaster == nil {
+            startPublishing()
+        } else if !wanted, broadcaster != nil {
+            stopPublishing()
+        }
+    }
+
+    private func startPublishing() {
+        let broadcaster = SpectrumBroadcaster(name: publishName, passcode: publishPasscode)
+        broadcaster.onSetIntegrationMillis = { [weak self] value in
+            guard let self, !self.isRemote else { throw LabcastError.remote("not available") }
+            self.integrationMillis = value
+            return self.integrationMillis
+        }
+        broadcaster.onSetScansToAverage = { [weak self] value in
+            guard let self, !self.isRemote else { throw LabcastError.remote("not available") }
+            self.scansToAverage = value
+            return self.scansToAverage
+        }
+        broadcaster.onSubscribersChanged = { [weak self, weak broadcaster] count in
+            guard let self, let broadcaster, self.broadcaster === broadcaster else { return }
+            self.viewerCount = count
+        }
+        self.broadcaster = broadcaster
+        publishedStatus = nil
+        publishedDevice = nil
+        publishState()
+        // Anything the sidebar shows may have changed; publishState sends
+        // only what actually did.
+        stateObserver = objectWillChange.sink { [weak self] in
+            self?.schedulePublishState()
+        }
+        Task {
+            do {
+                try await broadcaster.start()
+            } catch {
+                guard self.broadcaster === broadcaster else { return }
+                samundraLog.error("Publishing failed: \(String(describing: error), privacy: .public)")
+                self.stopPublishing()
+                self.isPublishing = false
+                self.publishError = "Sharing could not start."
+            }
+        }
+    }
+
+    private func stopPublishing() {
+        stateObserver = nil
+        broadcaster?.stop()
+        broadcaster = nil
+        viewerCount = 0
+    }
+
+    private func schedulePublishState() {
+        guard !statePublishScheduled else { return }
+        statePublishScheduled = true
+        Task { @MainActor in
+            self.statePublishScheduled = false
+            self.publishState()
+        }
+    }
+
+    private func publishState() {
+        guard let broadcaster, !isRemote else { return }
+        let device = RemoteDevice(info: deviceInfo)
+        if device != publishedDevice {
+            publishedDevice = device
+            broadcaster.publish(device: device.info)
+        }
+        var status = RemoteStatus(
+            connection: .searching,
+            failure: nil,
+            isAcquiring: isAcquiring,
+            lastError: lastError,
+            integrationMillis: integrationMillis,
+            scansToAverage: scansToAverage,
+            boxcarWidth: boxcarWidth,
+            electricDark: electricDark,
+            nonlinearity: nonlinearity,
+            trimMaskedPixels: trimMaskedPixels,
+            wavelengthOffsetNm: wavelengthOffsetNm)
+        switch connection {
+        case .searching: status.connection = .searching
+        case .connected: status.connection = .connected
+        case .failed(let message):
+            status.connection = .failed
+            status.failure = message
+        }
+        if status != publishedStatus {
+            publishedStatus = status
+            broadcaster.publish(status: status)
+        }
+    }
 
     /// Switch to the connected device's settings namespace and load its
     /// stored values. A device seen for the first time inherits the current
@@ -384,15 +768,6 @@ final class SpectrometerService: ObservableObject {
         }
     }
 
-    private func pushOptions() {
-        settings.options = ProcessingOptions(
-            electricDark: electricDark,
-            nonlinearity: nonlinearity,
-            boxcarWidth: boxcarWidth,
-            trimMaskedPixels: trimMaskedPixels,
-            wavelengthOffsetNm: wavelengthOffsetNm)
-    }
-
     // MARK: Connection
 
     private func attemptConnectIfNeeded() async {
@@ -409,6 +784,13 @@ final class SpectrometerService: ObservableObject {
             }
         }
         connecting = false
+        // A remote spectrometer was chosen while the USB open was in flight.
+        guard source == .local else {
+            if case .success(let opened) = result {
+                queue.async { opened.close() }
+            }
+            return
+        }
         switch result {
         case .success(let opened):
             samundraLog.info("Connected to \(opened.info.model, privacy: .public) \(opened.info.serialNumber, privacy: .public)")
@@ -435,6 +817,7 @@ final class SpectrometerService: ObservableObject {
     }
 
     private func handleUnplug() {
+        guard !isRemote else { return }
         recycleConnection(reason: "Spectrometer disconnected.")
     }
 
@@ -446,24 +829,28 @@ final class SpectrometerService: ObservableObject {
     }
 
     private func startEngine(with device: HR4000Device) {
+        // The callbacks of an engine that was shut down because a remote
+        // spectrometer took over must not touch the remote's state.
         let engine = AcquisitionEngine(
             device: device,
             queue: usbQueue,
             settings: settings,
             onSpectrum: { [weak self] spectrum, rate in
-                guard let self else { return }
+                guard let self, !self.isRemote else { return }
                 self.lastSpectrumAt = Date()
                 if let rate { self.acquisitionRate = rate }
+                self.broadcaster?.publish(spectrum: spectrum, rate: self.acquisitionRate)
                 if !self.isPaused {
                     self.latestSpectrum = spectrum
                 }
             },
             onStopped: { [weak self] in
-                self?.isAcquiring = false
-                self?.acquisitionRate = nil
+                guard let self, !self.isRemote else { return }
+                self.isAcquiring = false
+                self.acquisitionRate = nil
             },
             onError: { [weak self] error in
-                guard let self else { return }
+                guard let self, !self.isRemote else { return }
                 self.isAcquiring = false
                 self.acquisitionRate = nil
                 self.lastError = error.localizedDescription
@@ -500,24 +887,29 @@ final class SpectrometerService: ObservableObject {
 
     private func recycleConnection(reason: String) {
         samundraLog.error("\(reason, privacy: .public) Resetting the connection.")
-        settings.running = false
-        engine = nil
+        closeDevice()
         isAcquiring = false
         acquisitionRate = nil
-        engineStartedAt = nil
         lastSpectrumAt = nil
-        if let old = device {
-            device = nil
-            old.cancelInFlightTransfers()
-            usbQueue.async { old.close() }
-        }
         deviceInfo = nil
         connection = .searching
         lastError = reason
     }
 
+    /// Stops the engine and closes the USB device, if there is one.
+    private func closeDevice() {
+        settings.running = false
+        engine = nil
+        engineStartedAt = nil
+        if let old = device {
+            device = nil
+            old.cancelInFlightTransfers()
+            usbQueue.async { old.close() }
+        }
+    }
+
     func stopRecording() {
-        guard isAcquiring else { return }
+        guard isAcquiring, !isRemote else { return }
         settings.running = false
         // Unblock a long in-flight integration immediately. The abort must
         // not run on the USB queue (the blocked read occupies it), and even
@@ -567,7 +959,11 @@ final class SpectrometerService: ObservableObject {
         }
         return nsError.code == kIOReturnNoDevice || nsError.code == kIOReturnNotAttached
     }
+
+    #endif
 }
 
+#if os(macOS)
 private let kIOReturnNoDevice = Int(bitPattern: 0xE00002C0)
 private let kIOReturnNotAttached = Int(bitPattern: 0xE00002D9)
+#endif

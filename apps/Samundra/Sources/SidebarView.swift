@@ -19,6 +19,8 @@ struct SidebarView: View {
 
     var body: some View {
         Form {
+            SourceSection()
+
             Section("Acquisition") {
                 LabeledContent("Integration time") {
                     HStack(spacing: 4) {
@@ -50,13 +52,15 @@ struct SidebarView: View {
                         .frame(width: 64)
                 }
                 .help("Smooths each spectrum over ±N pixels")
+                .disabled(service.isRemote)
             }
 
             Section("Corrections") {
                 Toggle("Electric dark", isOn: $service.electricDark)
                     .help("Subtracts the average of the optically masked pixels")
+                    .disabled(service.isRemote)
                 Toggle("Nonlinearity", isOn: $service.nonlinearity)
-                    .disabled(service.deviceInfo?.nonlinearityCoefficients == nil)
+                    .disabled(service.isRemote || service.deviceInfo?.nonlinearityCoefficients == nil)
                     .help("Applies the detector linearity polynomial from the EEPROM")
 
                 LabeledContent("Wavelength offset") {
@@ -73,6 +77,7 @@ struct SidebarView: View {
                     }
                 }
                 .help("Added to the displayed and saved wavelengths to compensate calibration drift")
+                .disabled(service.isRemote)
             }
 
             Section("Peaks") {
@@ -165,6 +170,7 @@ struct SidebarView: View {
                     .help("Fixes the Y axis at the detector's full range")
                 Toggle("Trim masked pixels", isOn: $service.trimMaskedPixels)
                     .help("Removes the detector's dummy and optically masked pixels from the plot and from saved files")
+                    .disabled(service.isRemote)
             }
 
             if let info = service.deviceInfo {
@@ -185,6 +191,104 @@ struct SidebarView: View {
         .formStyle(.grouped)
     }
 
+}
+
+/// Chooses the spectrometer: the one on this Mac's USB, or one that another
+/// Mac shares on the local network. On a Mac it also holds the switch that
+/// shares this Mac's spectrometer.
+private struct SourceSection: View {
+    @EnvironmentObject private var service: SpectrometerService
+
+    /// "" selects the local spectrometer; anything else is a peer's id.
+    private var selection: Binding<String> {
+        Binding(
+            get: {
+                if case .remote(let id, _) = service.source { return id }
+                return ""
+            },
+            set: { id in
+                if let peer = peers.first(where: { $0.id == id }) {
+                    service.selectRemote(peer)
+                } else if id.isEmpty {
+                    service.selectLocal()
+                }
+            })
+    }
+
+    /// Other Macs sharing a spectrometer (not this one).
+    private var peers: [LabcastPeer] {
+        #if os(macOS)
+        service.isPublishing
+            ? service.remotePeers.filter { $0.name != service.publishName }
+            : service.remotePeers
+        #else
+        service.remotePeers
+        #endif
+    }
+
+    private var needsPasscode: Bool {
+        if case .remote(let id, _) = service.source {
+            return peers.first(where: { $0.id == id })?.requiresPasscode ?? !service.remotePasscode.isEmpty
+        }
+        return peers.contains(where: \.requiresPasscode)
+    }
+
+    var body: some View {
+        Section("Spectrometer") {
+            Picker("Source", selection: selection) {
+                #if os(macOS)
+                Text("USB").tag("")
+                #else
+                Text("None").tag("")
+                #endif
+                ForEach(peers) { peer in
+                    Text(peer.name).tag(peer.id)
+                }
+                // Keep the selection valid while its Mac is off the network.
+                if case .remote(let id, let name) = service.source,
+                   !peers.contains(where: { $0.id == id }) {
+                    Text("\(name) (unavailable)").tag(id)
+                }
+            }
+            .help("The spectrometer on this Mac\u{2019}s USB, or one shared by another Mac on the local network")
+
+            if needsPasscode {
+                LabeledContent("Passcode") {
+                    SecureField("Passcode", text: $service.remotePasscode)
+                        .labelsHidden()
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 110)
+                        .onSubmit { service.reconnectRemote() }
+                }
+                .help("The passcode set on the Mac sharing the spectrometer; press Return to connect")
+            }
+
+            #if os(macOS)
+            Toggle("Share on local network", isOn: Binding(
+                get: { service.isPublishing },
+                set: { service.setPublishing($0) }))
+            .disabled(service.isRemote)
+            .help("Lets Samundra on other devices on this network show this Mac\u{2019}s spectrometer as \u{201C}\(service.publishName)\u{201D}")
+
+            LabeledContent("Sharing passcode") {
+                SecureField("Optional", text: $service.publishPasscode)
+                    .labelsHidden()
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 110)
+            }
+            .disabled(service.isPublishing)
+            .help("Optional. Viewers must enter the same passcode, and the link is encrypted. Turn sharing off to change it.")
+
+            if let error = service.publishError {
+                Text(error)
+                    .font(.callout)
+                    .foregroundStyle(.red)
+            } else if service.isPublishing, !service.isRemote {
+                LabeledContent("Viewers", value: "\(service.viewerCount)")
+            }
+            #endif
+        }
+    }
 }
 
 /// The NIST catalog entries passing the current Reference Lines filters,

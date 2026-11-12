@@ -2,13 +2,19 @@
 // serial number. Acquisition is automatic whenever one is connected; Space
 // pauses, and focus lives on the chart unless a control claims it.
 
+#if os(macOS)
 import AppKit
+#endif
 import SwiftUI
 
 struct SpectrumView: View {
     @EnvironmentObject private var service: SpectrometerService
     @FocusState private var mainViewFocused: Bool
+    #if os(macOS)
     @State private var keyMonitor: Any?
+    #else
+    @State private var exporting = false
+    #endif
 
     var body: some View {
         NavigationSplitView {
@@ -27,8 +33,15 @@ struct SpectrumView: View {
             .focused($mainViewFocused)
             // Clicking the plot takes focus back from any sidebar control.
             .simultaneousGesture(TapGesture().onEnded { mainViewFocused = true })
+            #if !os(macOS)
+            .onKeyPress(.space) {
+                service.isPaused.toggle()
+                return .handled
+            }
+            #endif
         }
         .navigationTitle(service.deviceInfo?.serialNumber ?? "Samundra")
+        #if os(macOS)
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 pauseButton
@@ -57,6 +70,33 @@ struct SpectrumView: View {
                 self.keyMonitor = nil
             }
         }
+        #else
+        // No menu bar here: Pause and Save live in the toolbar.
+        .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                pauseButton
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                ConnectionBadge()
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    exporting = true
+                } label: {
+                    Label("Save…", systemImage: "square.and.arrow.down")
+                }
+                .keyboardShortcut("s", modifiers: .command)
+                .disabled(service.latestSpectrum == nil)
+                .help("Save the displayed spectrum as CSV")
+            }
+        }
+        .fileExporter(
+            isPresented: $exporting,
+            document: service.latestSpectrum.map(SpectrumCSVDocument.init),
+            contentType: .commaSeparatedText,
+            defaultFilename: "Spectrum"
+        ) { _ in }
+        #endif
     }
 
     private var pauseButton: some View {
@@ -71,6 +111,7 @@ struct SpectrumView: View {
               : "Freeze the displayed spectrum (Space)")
     }
 
+    #if os(macOS)
     /// Space toggles pause anywhere except while editing text; Escape ends
     /// any editing and returns focus to the chart. Both defer to other key
     /// windows (e.g. the save panel).
@@ -96,16 +137,24 @@ struct SpectrumView: View {
         }
     }
 
+    #endif
+
     private var placeholder: some View {
         ContentUnavailableView {
             Label("No Spectrum", systemImage: "waveform.path")
         } description: {
-            switch service.connection {
-            case .connected:
+            switch (service.connection, service.source) {
+            case (.connected, _):
                 Text("Connected to the \(service.deviceInfo?.model ?? "spectrometer") — waiting for the first spectrum…")
-            case .searching:
+            case (.searching, .remote(_, let name)):
+                Text(service.lastError ?? "Waiting for a spectrometer on \(name)…")
+            case (.searching, .local):
+                #if os(macOS)
                 Text("Searching for a spectrometer on USB. Recording starts automatically when one connects.")
-            case .failed(let message):
+                #else
+                Text("Choose a Mac that is sharing its spectrometer under Spectrometer in the sidebar. On that Mac, turn on Share on local network in Samundra.")
+                #endif
+            case (.failed(let message), _):
                 Text(message)
             }
         }
@@ -143,6 +192,9 @@ struct ConnectionBadge: View {
         case .connected:
             return nil  // the window title carries the serial number
         case .searching:
+            #if !os(macOS)
+            if service.source == .local { return "No spectrometer" }
+            #endif
             return "Searching…"
         case .failed:
             return "Error"
@@ -155,6 +207,9 @@ struct ConnectionBadge: View {
             let info = service.deviceInfo
             return "\(info?.model ?? "Spectrometer") \(info?.serialNumber ?? "") connected"
         case .searching:
+            if case .remote(_, let name) = service.source {
+                return service.lastError ?? "Waiting for a spectrometer on \(name)"
+            }
             return "No spectrometer found; the app connects and records automatically when one appears"
         case .failed(let message):
             return message

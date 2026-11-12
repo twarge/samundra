@@ -2,8 +2,10 @@
 // bundled NIST catalog so only elements that actually have lines can be
 // chosen. Backed by NSTokenField — SwiftUI has no native token field.
 
-import AppKit
 import SwiftUI
+
+#if os(macOS)
+import AppKit
 
 struct ElementTokenField: NSViewRepresentable {
     @Binding var text: String
@@ -27,17 +29,6 @@ struct ElementTokenField: NSViewRepresentable {
         if field.currentEditor() == nil,
            ((field.objectValue as? [String]) ?? []) != tokens {
             field.objectValue = tokens
-        }
-    }
-
-    /// Parse preserving entry order, canonicalized and deduplicated.
-    static func orderedTokens(from text: String) -> [String] {
-        var seen = Set<String>()
-        return text.split(whereSeparator: { ",; ".contains($0) }).compactMap { token in
-            let symbol = token.trimmingCharacters(in: .whitespaces)
-            guard !symbol.isEmpty else { return nil }
-            let canonical = symbol.prefix(1).uppercased() + symbol.dropFirst().lowercased()
-            return seen.insert(canonical).inserted ? canonical : nil
         }
     }
 
@@ -93,6 +84,43 @@ struct ElementTokenField: NSViewRepresentable {
             if joined != parent.text {
                 parent.text = joined
             }
+        }
+    }
+}
+
+#else
+
+/// Without NSTokenField: a plain text field that keeps, on Return, the
+/// symbols the catalog knows.
+struct ElementTokenField: View {
+    @Binding var text: String
+    @State private var draft = ""
+
+    var body: some View {
+        TextField("Any", text: $draft)
+            .autocorrectionDisabled()
+            .onSubmit {
+                let known = Set(AtomicLineDatabase.shared.lines.map(\.element))
+                text = Self.orderedTokens(from: draft)
+                    .filter(known.contains)
+                    .joined(separator: ", ")
+                draft = text
+            }
+            .onAppear { draft = text }
+    }
+}
+
+#endif
+
+extension ElementTokenField {
+    /// Parse preserving entry order, canonicalized and deduplicated.
+    static func orderedTokens(from text: String) -> [String] {
+        var seen = Set<String>()
+        return text.split(whereSeparator: { ",; ".contains($0) }).compactMap { token in
+            let symbol = token.trimmingCharacters(in: .whitespaces)
+            guard !symbol.isEmpty else { return nil }
+            let canonical = symbol.prefix(1).uppercased() + symbol.dropFirst().lowercased()
+            return seen.insert(canonical).inserted ? canonical : nil
         }
     }
 }

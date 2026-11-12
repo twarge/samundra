@@ -4,14 +4,14 @@
 
 import Foundation
 
-struct Spectrum: Equatable {
-    struct Device: Equatable {
+struct Spectrum: Equatable, Sendable {
+    struct Device: Equatable, Codable, Sendable {
         var model: String
         var serialNumber: String
         var wavelengthCoefficients: [Double]
     }
 
-    struct Acquisition: Equatable {
+    struct Acquisition: Equatable, Codable, Sendable {
         var timestamp: Date
         var integrationMicros: Int
         var scansAveraged: Int

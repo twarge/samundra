@@ -57,6 +57,24 @@ with `SAMUNDRA_AUTOTEST=1` in the environment and it captures one spectrum
 after connecting, reporting the result to the unified log (subsystem
 `com.twarge.samundra`).
 
+## Viewing a spectrometer from another device
+
+Turn on **Share on local network** in the sidebar and the Mac that owns the
+spectrometer publishes it (off by default; an optional passcode encrypts the
+link). Samundra on another Mac or on Apple Vision Pro lists it under
+**Spectrometer ▸ Source** and shows the same live chart, peaks, reference
+lines and Save. A viewer can change the integration time and scan averaging;
+the other acquisition settings are shown read-only. The visionOS build has no
+USB driver and is a viewer only.
+
+The transport is Labcast (`apps/Samundra/Sources/Labcast`, a verbatim copy of
+the Labcast package's sources); the topics and payloads are described in
+`SpectrumWire.swift`. A loopback test is built into the macOS app: launch the
+app binary with `SAMUNDRA_LABCAST_SELFTEST=1` and it publishes a synthetic
+spectrometer on 127.0.0.1, views it through the app's remote-spectrometer
+path, prints one line per check, and exits 0 if everything received equals
+what was published.
+
 ## How it talks to the HR4000
 
 The HR4000 (USB VID 0x2457, PID 0x1012) exposes a vendor-specific interface:

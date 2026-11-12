@@ -1,7 +1,9 @@
 // Live spectrum plot: decimated line with a visible-spectrum gradient and a
 // wavelength readout on hover.
 
+#if os(macOS)
 import AppKit
+#endif
 import Charts
 import SwiftUI
 
@@ -14,6 +16,7 @@ private struct SidesOnlyClipShape: Shape {
     }
 }
 
+#if os(macOS)
 /// SwiftUI has no scroll-wheel gesture, and its magnify gesture cannot track
 /// a pinch's moving midpoint; a local event monitor handles both whenever
 /// the cursor is over this view's frame, so two-finger pan and pinch zoom
@@ -81,6 +84,8 @@ private struct TrackpadEventCatcher: NSViewRepresentable {
     }
 }
 
+#endif
+
 struct PlotPoint: Identifiable {
     let id: Int
     let x: Double
@@ -107,6 +112,10 @@ struct SpectrumChartView: View {
     @State private var dragAnchor: Double?
     @State private var plotWidth: CGFloat = 0
     @State private var yTop = 0.0
+    #if !os(macOS)
+    /// The pinch gesture reports cumulative magnification; zooming wants steps.
+    @State private var lastMagnification: CGFloat = 1
+    #endif
 
     private var fullSpan: Double { xDomain.upperBound - xDomain.lowerBound }
     private var visibleSpan: Double {
@@ -280,6 +289,7 @@ struct SpectrumChartView: View {
                     plotWidthChanged: { plotWidth = $0 })
             }
         }
+        #if os(macOS)
         .background(TrackpadEventCatcher(
             onHorizontalScroll: { deltaX in
                 panTo(scrollX - Double(deltaX) * nmPerPoint)
@@ -287,6 +297,16 @@ struct SpectrumChartView: View {
             onMagnify: { delta, location in
                 zoom(by: delta, atX: location.x)
             }))
+        #else
+        .simultaneousGesture(
+            MagnifyGesture()
+                .onChanged { value in
+                    let step = value.magnification / lastMagnification - 1
+                    lastMagnification = value.magnification
+                    zoom(by: step, atX: value.startLocation.x)
+                }
+                .onEnded { _ in lastMagnification = 1 })
+        #endif
         .contextMenu {
             Button("Copy Data") {
                 copySpectrumCSV(spectrum)

@@ -1,14 +1,30 @@
 // Single-window viewer and recorder for Ocean Optics HR4000 spectrometers.
 
+#if os(macOS)
 import AppKit
+#else
+import UIKit
+#endif
 import SwiftUI
 import UniformTypeIdentifiers
 
 @main
+enum SamundraMain {
+    @MainActor
+    static func main() {
+        #if os(macOS)
+        // Headless self-test (`SAMUNDRA_LABCAST_SELFTEST=1`); never returns.
+        if LabcastSelfTest.isRequested { LabcastSelfTest.runAndExit() }
+        #endif
+        SamundraApp.main()
+    }
+}
+
 struct SamundraApp: App {
     @StateObject private var service = SpectrometerService()
 
     var body: some Scene {
+        #if os(macOS)
         Window("Samundra", id: "main") {
             SpectrumView()
                 .environmentObject(service)
@@ -21,8 +37,17 @@ struct SamundraApp: App {
             }
             SpectrumCommands(service: service)
         }
+        #else
+        WindowGroup {
+            SpectrumView()
+                .environmentObject(service)
+        }
+        .defaultSize(width: 1060, height: 660)
+        #endif
     }
 }
+
+#if os(macOS)
 
 struct SpectrumCommands: Commands {
     // Observed so the Share item's enabled state tracks spectrum arrival.
@@ -87,10 +112,38 @@ struct SpectrumCommands: Commands {
     }
 }
 
+#else
+
+/// The spectrum as the CSV file Save writes, for `fileExporter`.
+struct SpectrumCSVDocument: FileDocument {
+    static let readableContentTypes: [UTType] = [.commaSeparatedText]
+
+    let data: Data
+
+    init(spectrum: Spectrum) {
+        data = spectrum.csvData()
+    }
+
+    init(configuration: ReadConfiguration) throws {
+        data = configuration.file.regularFileContents ?? Data()
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
+    }
+}
+
+#endif
+
 /// Puts the spectrum on the pasteboard as CSV, byte-identical to a saved file.
 @MainActor
 func copySpectrumCSV(_ spectrum: Spectrum) {
+    let csv = String(decoding: spectrum.csvData(), as: UTF8.self)
+    #if os(macOS)
     let pasteboard = NSPasteboard.general
     pasteboard.clearContents()
-    pasteboard.setString(String(decoding: spectrum.csvData(), as: UTF8.self), forType: .string)
+    pasteboard.setString(csv, forType: .string)
+    #else
+    UIPasteboard.general.string = csv
+    #endif
 }

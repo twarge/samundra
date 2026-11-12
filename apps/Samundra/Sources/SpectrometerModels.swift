@@ -51,3 +51,18 @@ struct SpectrometerModel: Sendable {
         supported.first { $0.productID == productID }
     }
 }
+
+/// What the app knows about a connected spectrometer: its identity and the
+/// calibration read from its EEPROM. Filled in by the USB driver on the Mac
+/// that owns the instrument, and received as-is by a remote viewer.
+struct SpectrometerInfo: Codable, Equatable, Sendable {
+    let model: String
+    let serialNumber: String
+    let wavelengthCoefficients: [Double]
+    let nonlinearityCoefficients: [Double]?
+    let wavelengths: [Double]
+    let usbHighSpeed: Bool
+    let darkPixels: Range<Int>
+    let firstSignalPixel: Int
+    let fullScaleCounts: Double
+}
